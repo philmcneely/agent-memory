@@ -42,3 +42,25 @@ preserves Unicode, case, order, repetition, punctuation and internal whitespace.
 paths, weights and bookkeeping timestamps do not establish semantic identity. The oldest
 duplicate remains active, with name breaking creation-time ties; other copies retain their
 files and point to it. Similarity alone belongs to the reviewed proposal path.
+
+Configuration persistence preserves strings and field names exactly, including backslashes, quotation marks and control characters. A saved configuration remains readable without changing executor commands or field-source identities.
+
+Custom memory types occupy the truth namespace exclusively. Schemas cannot reuse archive, projection, schema or report directory names and silently write knowledge outside the discoverable truth tree.
+
+Memory identity and type identifiers match their complete slug grammar. Trailing newlines cannot create filenames whose identity changes when frontmatter is parsed.
+
+Malformed final operations or exhausted executor negotiation cannot mark an archived batch as distilled. The boundary reports validation failure before draining pending operations or publishing projection writes, preserving the raw backlog for a later retry.
+
+Import preflights all file entries before publishing any imported file. A malformed late entry leaves earlier truth unchanged.
+
+MCP dispatch validates the scalar and mapping types advertised by its tool catalogue before coercion or core execution. Recall limits must be positive integers, so invalid requests return validation errors without writing truth or terminating the server.
+
+An externally edited memory that fails validation leaves the retrieval projection immediately while its truth file remains intact. Repairing the file restores eligibility through the ordinary projection path.
+
+A memory validity interval cannot end before its start. Direct writes reject reversed intervals before publishing the Markdown projection and preserve the previous truth file.
+
+The in-memory schema projection tracks schema file content. A long-lived store observes external edits, additions and removals instead of continuing to route writes using stale schema definitions.
+
+The injected index keeps fitting lower-priority memories when an earlier entry exceeds the remaining byte budget. Oversized entries cannot suppress the entire remaining recall surface.
+
+The root index byte budget includes its header. If a configured header cannot fit, the projection is empty rather than exceeding the budget.

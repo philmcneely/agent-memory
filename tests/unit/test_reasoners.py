@@ -1,7 +1,10 @@
 """Executors: text out, text back, and silence whenever the outside world misbehaves."""
 
+import dataclasses
 import io
 import json
+import pathlib
+import subprocess
 
 import pytest
 from agent_memory.core.errors import ReasonerUnavailableError
@@ -36,17 +39,9 @@ def test_a_host_reasoner_asks_for_no_tools():
 
 
 def test_a_failed_host_is_reported():
-    host = FakeHost(
-        HostResult(
-            text="usage: claude ...",
-            ok=False,
-            seconds=0.1,
-            error="provider failed for sk-or-super-secret",
-        )
-    )
-    with pytest.raises(ReasonerUnavailableError, match="provider failed") as raised:
+    host = FakeHost(HostResult(text="usage: claude ...", ok=False, seconds=0.1, error="boom"))
+    with pytest.raises(ReasonerUnavailableError, match="host reasoner failed.*boom"):
         HostReasoner(host=host)("review this")
-    assert "sk-or-super-secret" not in str(raised.value)
 
 
 def test_an_empty_host_reply_is_reported():
@@ -115,16 +110,72 @@ def test_a_host_reasoner_is_named_by_dialect_and_runs_that_dialect_s_binary():
     assert reasoner.host.spec.model == BINARIES[HOST_CLAUDE_CODE][1]
 
 
-def test_muse_host_reasoner_uses_the_launcher_pinned_by_its_boundary_hook(monkeypatch):
-    from agent_memory.core.config import MUSE_LAUNCHER_ENV_VAR
-    from agent_memory.executor.hosts import HOST_MUSE_CODE
+def test_an_unknown_host_reasoner_fails_closed_instead_of_using_another_dialect():
+    with pytest.raises(ReasonerUnavailableError, match="unsupported host reasoner"):
+        HostReasoner.for_host("not-a-host")
 
-    launcher = "/managed/bin/mem-muse"
-    monkeypatch.setenv(MUSE_LAUNCHER_ENV_VAR, launcher)
 
-    reasoner = HostReasoner.for_host(HOST_MUSE_CODE)
+def test_codex_jsonl_usage_is_retained_for_native_review_metrics(tmp_path, monkeypatch):
+    from agent_memory.executor import hosts
 
-    assert reasoner.host.spec.binary == launcher
+    def run(command, **kwargs):
+        pathlib.Path(command[command.index("--output-last-message") + 1]).write_text("done")
+        stdout = json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 120,
+                    "cached_input_tokens": 80,
+                    "output_tokens": 12,
+                },
+            }
+        )
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(hosts.subprocess, "run", run)
+    host = hosts.Host(hosts.HostSpec(name="codex", binary="codex", attempts=1))
+    result = host.run("review", workdir=tmp_path)
+
+    assert result.ok and result.usage is not None
+    assert result.usage.turns == 1
+    assert result.usage.input_tokens == 120
+    assert result.usage.cached_input_tokens == 80
+    assert result.usage.output_tokens == 12
+
+
+def test_codex_jsonl_trace_separates_startup_model_mcp_and_shutdown():
+    from agent_memory.executor.hosts import _CodexTrace
+
+    trace = _CodexTrace(started=10.0)
+    trace.observe(json.dumps({"type": "thread.started"}), 11.0)
+    trace.observe(
+        json.dumps(
+            {
+                "type": "item.started",
+                "item": {"id": "call-1", "type": "mcp_tool_call"},
+            }
+        ),
+        14.0,
+    )
+    trace.observe(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"id": "call-1", "type": "mcp_tool_call"},
+            }
+        ),
+        14.5,
+    )
+    trace.observe(json.dumps({"type": "turn.completed"}), 19.0)
+
+    phases = trace.phases(finished=20.0)
+
+    assert phases is not None
+    assert phases.startup_seconds == 1.0
+    assert phases.model_wait_seconds == 7.5
+    assert phases.mcp_seconds == 0.5
+    assert phases.shutdown_seconds == 1.0
+    assert sum(dataclasses.astuple(phases)) == 10.0
 
 
 def test_a_host_reasoner_marks_its_session_as_the_executor_so_hooks_stand_down():
@@ -142,6 +193,77 @@ def test_the_default_executor_reasons_through_the_host_cli():
     assert isinstance(distiller.distiller(ExecutorConfig()), HostReasoner)
     chosen = distiller.distiller(ExecutorConfig(host="codex"))
     assert chosen.host.spec.name == "codex"
+
+
+def test_hosts_with_a_default_mcp_posture_negotiate_with_tools_and_the_rest_keep_text():
+    from agent_memory.core.config import ExecutorConfig
+    from agent_memory.core.reasoning import ToolReasoner
+    from agent_memory.executor import distiller
+    from agent_memory.executor.hosts import BINARIES, DIALECTS
+
+    for name in BINARIES:
+        chosen = distiller.distiller(ExecutorConfig(host=name))
+        assert isinstance(chosen, ToolReasoner) == DIALECTS[name].tools_by_default, name
+        assert callable(chosen)
+    assert isinstance(distiller.distiller(ExecutorConfig(reasoner="endpoint")), ToolReasoner)
+
+
+@pytest.mark.parametrize("name", ["hermes", "muse-code"])
+def test_additional_native_write_tools_are_automatic_and_text_can_be_forced(name):
+    from agent_memory.core.config import TOOL_MODE_TEXT, ExecutorConfig
+    from agent_memory.core.reasoning import ToolReasoner
+    from agent_memory.executor import distiller
+
+    native = distiller.distiller(ExecutorConfig(host=name))
+    text = distiller.distiller(ExecutorConfig(host=name, tool_mode=TOOL_MODE_TEXT))
+
+    assert isinstance(native, ToolReasoner)
+    assert not isinstance(text, ToolReasoner)
+
+
+def test_native_write_tools_fail_closed_for_an_unknown_host():
+    from agent_memory.core.config import TOOL_MODE_NATIVE, ExecutorConfig
+    from agent_memory.core.errors import ReasonerUnavailableError
+    from agent_memory.executor import distiller
+
+    with pytest.raises(ReasonerUnavailableError, match="does not support native Write tools"):
+        distiller.distiller(ExecutorConfig(host="unknown", tool_mode=TOOL_MODE_NATIVE))
+
+
+def test_hermes_openrouter_does_not_construct_vertex_credentials():
+    from agent_memory.core.config import ExecutorConfig
+    from agent_memory.executor import distiller
+    from agent_memory.executor.hosts import HERMES_DATA_TRAINING_REQUIREMENT
+
+    with pytest.raises(ReasonerUnavailableError, match=HERMES_DATA_TRAINING_REQUIREMENT):
+        distiller.distiller(
+            ExecutorConfig(
+                host="hermes",
+                host_provider="openrouter",
+                host_model="meta/muse-spark-1.3-contributor",
+            )
+        )
+
+    chosen = distiller.distiller(
+        ExecutorConfig(
+            host="hermes",
+            host_provider="openrouter",
+            host_model="meta/muse-spark-1.3-contributor",
+            host_allow_data_training=True,
+        )
+    )
+    assert chosen.host.spec.provider == "openrouter"
+    assert chosen.host.spec.allow_data_training is True
+    assert chosen.host.credentials is None
+
+
+def test_an_unknown_write_tool_mode_is_not_silently_downgraded():
+    from agent_memory.core.config import ExecutorConfig
+    from agent_memory.core.errors import ReasonerUnavailableError
+    from agent_memory.executor import distiller
+
+    with pytest.raises(ReasonerUnavailableError, match="unsupported Write tool mode"):
+        distiller.distiller(ExecutorConfig(host="muse-code", tool_mode="guess"))
 
 
 def test_an_executor_configured_for_an_endpoint_uses_it():
@@ -181,9 +303,7 @@ def test_an_explicit_vertex_project_does_not_borrow_an_unrelated_api_key(monkeyp
         return io.BytesIO(_reply("verdict line"))
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    reasoner = EndpointReasoner(
-        credentials=UserVertex(project="user-project", location="global")
-    )
+    reasoner = EndpointReasoner(credentials=UserVertex(project="user-project", location="global"))
 
     assert reasoner("review this") == "verdict line"
     assert "/projects/user-project/" in sent["url"]

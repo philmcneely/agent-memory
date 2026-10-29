@@ -15,6 +15,12 @@ INDEX_DIRNAME = ".index"
 STATE_DIRNAME = ".state"
 INDEX_DB_FILENAME = "index.db"
 LOCK_FILENAME = "store.lock"
+DREAM_STATE_FILENAME = "auto-dream.json"
+DREAM_CLAIM_LOCK_FILENAME = "auto-dream-claim.lock"
+DREAM_RUN_LOCK_FILENAME = "auto-dream-run.lock"
+MAINTENANCE_LOCK_FILENAME = "maintenance.lock"
+CAPTURE_LOCK_FILENAME = "capture.lock"
+DISTILL_LOCK_DIRNAME = "distill-locks"
 MEMORY_SUFFIX = ".md"
 
 
@@ -60,6 +66,30 @@ class StoreLayout:
         return self.state_dir / LOCK_FILENAME
 
     @property
+    def dream_state(self) -> pathlib.Path:
+        return self.state_dir / DREAM_STATE_FILENAME
+
+    @property
+    def dream_claim_lock(self) -> pathlib.Path:
+        return self.state_dir / DREAM_CLAIM_LOCK_FILENAME
+
+    @property
+    def dream_run_lock(self) -> pathlib.Path:
+        return self.state_dir / DREAM_RUN_LOCK_FILENAME
+
+    @property
+    def maintenance_lock(self) -> pathlib.Path:
+        return self.state_dir / MAINTENANCE_LOCK_FILENAME
+
+    @property
+    def capture_lock(self) -> pathlib.Path:
+        return self.state_dir / CAPTURE_LOCK_FILENAME
+
+    @property
+    def distill_locks(self) -> pathlib.Path:
+        return self.state_dir / DISTILL_LOCK_DIRNAME
+
+    @property
     def watermarks(self) -> pathlib.Path:
         return self.state_dir / self.config.write.watermark_dirname
 
@@ -96,6 +126,7 @@ class StoreLayout:
             self.index_dir,
             self.state_dir,
             self.watermarks,
+            self.distill_locks,
             self.dream_reports,
         ):
             path.mkdir(parents=True, exist_ok=True)

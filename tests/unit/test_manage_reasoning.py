@@ -1,15 +1,34 @@
 """The reasoning pass: judgement is borrowed, authority is not."""
 
 import json
+import pathlib
 
 import pytest
+from agent_memory.core.errors import ValidationError
 from agent_memory.core.manage import (
     PROPOSAL_ABSTRACT_REVIEW,
     PROPOSAL_MERGE,
     PROPOSAL_SUPERSEDE,
     Manage,
+    Proposal,
 )
-from agent_memory.core.reasoning import parse, render
+from agent_memory.core.manage_toolkit import (
+    ARG_NAME,
+    ARG_PROPOSAL,
+    ARG_VERDICTS,
+    TOOL_LIST,
+    TOOL_READ,
+    TOOL_SUBMIT,
+)
+from agent_memory.core.reasoning import (
+    ReviewLimits,
+    ReviewRuntime,
+    native_instructions,
+    native_material,
+    parse,
+    prepare,
+    render,
+)
 
 
 class Recorder:
@@ -22,6 +41,45 @@ class Recorder:
     def __call__(self, prompt: str) -> str:
         self.prompts.append(prompt)
         return self.replies.pop(0) if self.replies else ""
+
+
+class NativeRecorder:
+    def __init__(self, submit=True):
+        self.submit = submit
+        self.calls = 0
+        self.material = ""
+
+    def __call__(self, prompt):
+        raise AssertionError("native review must not use the text protocol")
+
+    def review_converse(self, instructions, material, kit):
+        self.calls += 1
+        self.material = material
+        assert "submit_verdicts" in instructions
+        kit.call(TOOL_LIST, {})
+        for proposal in kit.request.proposals:
+            for source in proposal.sources:
+                kit.call(
+                    TOOL_READ,
+                    {ARG_PROPOSAL: proposal.id, ARG_NAME: source.name},
+                )
+        if self.submit:
+            kit.call(
+                TOOL_SUBMIT,
+                {
+                    ARG_VERDICTS: [
+                        {"proposal": proposal.id, "verdict": "reject"}
+                        for proposal in kit.request.proposals
+                    ]
+                },
+            )
+        return ReviewRuntime(
+            duration_seconds=0.25,
+            startup_seconds=0.02,
+            model_wait_seconds=0.20,
+            mcp_seconds=0.02,
+            shutdown_seconds=0.01,
+        )
 
 
 def _twins(store):
@@ -228,3 +286,153 @@ def test_rendering_and_parsing_are_inverse_enough_to_round_trip(seeded):
     assert [verdict.proposal_id for verdict in parse(replies)] == [
         proposal.id for proposal in proposals
     ]
+
+
+def test_review_request_freezes_scoped_sources_and_their_hashes(seeded):
+    _twins(seeded)
+    proposals = Manage(seeded).proposals()
+    request = prepare(proposals, seeded.records(), ReviewLimits(8, 24, 120.0, 8000, 32000))
+
+    assert {proposal.id for proposal in request.proposals} == {
+        proposal.id for proposal in proposals
+    }
+    assert all(source.source_hash for proposal in request.proposals for source in proposal.sources)
+    assert all(source.valid_from for source in request.sources)
+    assert all(source.memory_created_at for source in request.sources)
+    assert all(source.memory_updated_at for source in request.sources)
+    assert request.limits.raw_session_evidence is False
+    assert {source.name for proposal in request.proposals for source in proposal.sources} <= {
+        target for proposal in proposals for target in proposal.targets
+    }
+    assert render(request) == render(proposals, seeded.records())
+
+
+def test_text_and_native_expose_distinct_temporal_semantics_for_supersede(store, clock):
+    store.config.manage.merge_proposal_similarity = 0.5
+    old = store.record(
+        type="fact",
+        name="kappa-retention",
+        abstract="Kappa retention policy",
+        body="Kappa retention is 30 days.",
+        valid_from="2025-02-01",
+    )
+    clock.advance(hours=1)
+    current = store.record(
+        type="fact",
+        name="kappa-retention-current",
+        abstract="Kappa retention policy current details",
+        body="Kappa retention is 45 days.",
+        valid_from="2026-01-01",
+    )
+    clock.advance(hours=1)
+    current = store.correct(current.name, body=current.body)
+    proposal = next(
+        item
+        for item in Manage(store).proposals()
+        if item.kind == PROPOSAL_SUPERSEDE and set(item.targets) == {old.name, current.name}
+    )
+    request = prepare([proposal], store.records(), ReviewLimits(8, 24, 120.0, 8000, 32000))
+    sources = {source.name: source for source in request.sources}
+
+    assert sources[old.name].valid_from == "2025-02-01T00:00:00Z"
+    assert sources[old.name].memory_created_at == old.created
+    assert sources[current.name].valid_from == "2026-01-01T00:00:00Z"
+    assert sources[current.name].memory_created_at == current.created
+    assert sources[current.name].memory_updated_at == current.updated
+    assert current.updated != current.created
+
+    text = render(request)
+    native = json.loads(native_material(request))["proposals"][0]["sources"]
+    native_by_name = {source["name"]: source for source in native}
+    for name, source in sources.items():
+        assert f"valid_from: {source.valid_from}" in text
+        assert f"type: {source.type}" in text
+        assert f"memory_created_at: {source.memory_created_at}" in text
+        assert f"memory_updated_at: {source.memory_updated_at}" in text
+        assert native_by_name[name]["valid_from"] == source.valid_from
+        assert native_by_name[name]["memory_created_at"] == source.memory_created_at
+        assert native_by_name[name]["memory_updated_at"] == source.memory_updated_at
+    assert "not original Session event times" in text
+    assert "do not show that the user confirmed" in text
+    assert "not original Session event times" in native_instructions()
+    assert "do not show that the user confirmed" in native_instructions()
+    assert "source role, confirmation status" in native_instructions()
+    assert "do not open raw sources indiscriminately" in native_instructions()
+    assert json.loads(native_material(request))["raw_session_evidence"] is False
+
+
+def test_missing_temporal_metadata_remains_unknown_in_both_review_modes(store):
+    record = store.record(
+        type="fact",
+        name="legacy-undated",
+        abstract="Legacy undated fact",
+        body="The migrated file has no trustworthy lifecycle timestamps.",
+    )
+    record.valid_from = None
+    record.created = ""
+    record.updated = ""
+    proposal = Proposal(
+        PROPOSAL_ABSTRACT_REVIEW,
+        (record.name,),
+        "abstract is too thin to recognise this memory by",
+    )
+    request = prepare([proposal], [record], ReviewLimits(8, 24, 120.0, 8000, 32000))
+    source = request.sources[0]
+
+    assert source.valid_from is None
+    assert source.memory_created_at is None
+    assert source.memory_updated_at is None
+    text = render(request)
+    assert "valid_from: unknown" in text
+    assert "memory_created_at: unknown" in text
+    assert "memory_updated_at: unknown" in text
+    native_source = json.loads(native_material(request))["proposals"][0]["sources"][0]
+    assert native_source["valid_from"] is None
+    assert native_source["memory_created_at"] is None
+    assert native_source["memory_updated_at"] is None
+
+
+def test_native_review_reads_evidence_submits_tools_and_reuses_manage_apply(seeded):
+    _twins(seeded)
+    reasoner = NativeRecorder()
+    report = Manage(seeded).sleep(reasoner=reasoner)
+
+    assert reasoner.calls == 1
+    assert "Longer body carrying" not in reasoner.material
+    assert report.review is not None
+    assert report.review.mode == "native"
+    assert report.review.complete
+    assert report.review.duration_seconds == 0.25
+    assert report.review.startup_seconds == 0.02
+    assert report.review.model_wait_seconds == 0.20
+    assert report.review.mcp_seconds == 0.02
+    assert report.review.shutdown_seconds == 0.01
+    assert report.review.apply_seconds >= 0.0
+    assert report.review.evidence_reads
+    assert [name for name, _ in report.review.tool_trace] == [
+        TOOL_LIST,
+        *[TOOL_READ for _ in report.review.evidence_reads],
+        TOOL_SUBMIT,
+    ]
+    assert all(decision.verdict == "rejected" for decision in report.decisions)
+    written = pathlib.Path(report.path).read_text()
+    assert "## review execution" in written
+    assert "startup_seconds: 0.020" in written
+    assert "model_wait_seconds: 0.200" in written
+    assert "mcp_seconds: 0.020" in written
+    assert "apply_seconds:" in written
+    assert "read_evidence" in written and "submit_verdicts" in written
+
+
+def test_native_review_without_a_complete_submission_fails_before_a_report(seeded):
+    _twins(seeded)
+    with pytest.raises(ValidationError, match="submitted no complete verdict set"):
+        Manage(seeded).sleep(reasoner=NativeRecorder(submit=False))
+    assert not list(seeded.layout.dream_reports.glob("*.md"))
+
+
+def test_no_proposals_skips_the_native_model_call(store):
+    reasoner = NativeRecorder()
+    report = Manage(store).sleep(reasoner=reasoner)
+    assert reasoner.calls == 0
+    assert report.review is None

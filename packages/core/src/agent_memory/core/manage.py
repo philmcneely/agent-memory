@@ -14,9 +14,13 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import os
 import pathlib
 import re
 import subprocess
+import tempfile
+import time
+from collections.abc import Iterable
 
 from . import reasoning, timestamp
 from . import record as record_module
@@ -30,11 +34,11 @@ from .schema import SOURCE_MENU, source_of
 from .sessions import parse_pointer
 from .store import Store
 
-PROPOSAL_MERGE = "merge"
-PROPOSAL_SUPERSEDE = "supersede"
-PROPOSAL_SPLIT = "split"
-PROPOSAL_DELETE = "delete"
-PROPOSAL_ABSTRACT_REVIEW = "abstract-review"
+PROPOSAL_MERGE = reasoning.PROPOSAL_MERGE
+PROPOSAL_SUPERSEDE = reasoning.PROPOSAL_SUPERSEDE
+PROPOSAL_SPLIT = reasoning.PROPOSAL_SPLIT
+PROPOSAL_DELETE = reasoning.PROPOSAL_DELETE
+PROPOSAL_ABSTRACT_REVIEW = reasoning.PROPOSAL_ABSTRACT_REVIEW
 
 ACTION_DATE_NORMALISED = "date-normalised"
 ACTION_DUPLICATE_MERGED = "duplicate-merged"
@@ -97,6 +101,8 @@ class DreamReport:
     decisions: tuple[Decision, ...] = ()
     withheld: tuple[str, ...] = ()
     committed: bool = False
+    dream_id: str = ""
+    review: reasoning.ReviewOutcome | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -108,6 +114,8 @@ class DreamReport:
             "withheld": list(self.withheld),
             "committed": self.committed,
             "path": self.path,
+            "dream_id": self.dream_id,
+            "review": _review_dict(self.review),
         }
 
 
@@ -128,7 +136,9 @@ class Manage:
             and sessions_since >= self._config.manage.trigger_min_sessions
         )
 
-    def sleep(self, reasoner: reasoning.Reasoner | None = None) -> DreamReport:
+    def sleep(
+        self, reasoner: reasoning.Reasoner | None = None, *, dream_id: str = ""
+    ) -> DreamReport:
         records = self._store.records()
         hits, reads, last_access = self._usage()
 
@@ -142,7 +152,7 @@ class Manage:
 
         records = self._store.records()
         proposals = self.proposals(records=records, hits=hits)
-        decisions, withheld = self._review(proposals, records, reasoner)
+        decisions, withheld, review = self._review(proposals, records, reasoner)
         settled = {decision.proposal_id for decision in decisions}
 
         report = DreamReport(
@@ -152,6 +162,8 @@ class Manage:
             inspected=len(records),
             decisions=decisions,
             withheld=withheld,
+            dream_id=dream_id,
+            review=review,
         )
         report = dataclasses.replace(report, path=str(self._write_report(report)))
         return dataclasses.replace(report, committed=self._commit(report))
@@ -161,17 +173,44 @@ class Manage:
         proposals: list[Proposal],
         records: list[MemoryRecord],
         reasoner: reasoning.Reasoner | None,
-    ) -> tuple[tuple[Decision, ...], tuple[str, ...]]:
+    ) -> tuple[tuple[Decision, ...], tuple[str, ...], reasoning.ReviewOutcome | None]:
         """A reasoner may refuse anything and accept up to the per-kind cap; a verdict on
         something that is not open, or that an earlier verdict invalidated, is dropped."""
         if reasoner is None or not proposals:
-            return (), ()
+            return (), (), None
+        request = reasoning.prepare(proposals, records, self._review_limits())
+        if isinstance(reasoner, reasoning.ManageToolReasoner):
+            from .manage_toolkit import ManageReviewToolkit
+
+            kit = ManageReviewToolkit(self._store, request)
+            runtime = reasoner.review_converse(
+                reasoning.native_instructions(), reasoning.native_material(request), kit
+            )
+            outcome = dataclasses.replace(
+                kit.outcome(),
+                duration_seconds=runtime.duration_seconds,
+                startup_seconds=runtime.startup_seconds,
+                model_wait_seconds=runtime.model_wait_seconds,
+                mcp_seconds=runtime.mcp_seconds,
+                shutdown_seconds=runtime.shutdown_seconds,
+                model_requests=runtime.model_requests,
+                agent_turns=runtime.agent_turns,
+                input_tokens=runtime.input_tokens,
+                cached_input_tokens=runtime.cached_input_tokens,
+                output_tokens=runtime.output_tokens,
+            )
+            if not outcome.complete:
+                raise ValidationError([FieldError("review", outcome.error)])
+        else:
+            outcome = reasoning.review_text(request, reasoner)
+        apply_started = time.monotonic()
         open_now = {proposal.id: proposal for proposal in proposals}
+        reviewed = {proposal.id: proposal for proposal in request.proposals}
         caps = self._caps()
         accepted: dict[str, int] = {}
         decisions: list[Decision] = []
         withheld: list[str] = []
-        for verdict in reasoning.parse(reasoner(reasoning.render(proposals, records))):
+        for verdict in outcome.verdicts:
             proposal = open_now.get(verdict.proposal_id)
             if proposal is None:
                 continue
@@ -179,13 +218,33 @@ class Manage:
                 withheld.append(proposal.id)
                 continue
             try:
-                decisions.append(self.decide(proposal.id, accept=verdict.accept, verdict=verdict))
+                decisions.append(
+                    self.decide(
+                        proposal.id,
+                        accept=verdict.accept,
+                        verdict=verdict,
+                        expected_sources=reviewed[proposal.id].sources,
+                    )
+                )
             except MemoryStoreError:
                 withheld.append(proposal.id)
                 continue
             if verdict.accept:
                 accepted[proposal.kind] = accepted.get(proposal.kind, 0) + 1
-        return tuple(decisions), tuple(withheld)
+        outcome = dataclasses.replace(outcome, apply_seconds=time.monotonic() - apply_started)
+        return tuple(decisions), tuple(withheld), outcome
+
+    def _review_limits(self) -> reasoning.ReviewLimits:
+        manage = self._config.manage
+        executor = self._config.executor
+        return reasoning.ReviewLimits(
+            max_steps=manage.review_max_steps,
+            max_tool_calls=manage.review_max_tool_calls,
+            timeout_seconds=executor.manage.timeout_seconds or executor.timeout_seconds,
+            tool_result_chars=manage.review_tool_result_chars,
+            evidence_chars=manage.review_evidence_chars,
+            raw_session_evidence=manage.review_raw_session_evidence,
+        )
 
     def _caps(self) -> dict[str, int]:
         manage = self._config.manage
@@ -217,11 +276,14 @@ class Manage:
         accept: bool,
         text: str = "",
         verdict: reasoning.Verdict | None = None,
+        *,
+        expected_sources: tuple[reasoning.ReviewSource, ...] = (),
     ) -> Decision:
         """Rule on one proposal. Acceptance applies it through the write path."""
         proposal = self._open(proposal_id)
+        self._require_sources(expected_sources)
         content = verdict or reasoning.Verdict(proposal_id, accept, text=text)
-        detail = self._apply(proposal, content) if accept else ""
+        detail = self._apply(proposal, content, expected_sources) if accept else ""
         return self._ledger().append(
             Decision(
                 proposal_id=proposal.id,
@@ -231,24 +293,44 @@ class Manage:
             )
         )
 
+    def _require_sources(self, sources: tuple[reasoning.ReviewSource, ...]) -> None:
+        for source in sources:
+            current = self._store.find(source.name)
+            if current is None or not current.is_active():
+                raise ValidationError(
+                    [FieldError("proposal", f"source {source.name} is no longer active")]
+                )
+            if current.source_hash != source.source_hash:
+                raise ValidationError(
+                    [FieldError("proposal", f"source {source.name} changed during review")]
+                )
+
     def _open(self, proposal_id: str) -> Proposal:
         for proposal in self.proposals():
             if proposal.id == proposal_id:
                 return proposal
         raise NotFoundError(f"no open proposal {proposal_id}")
 
-    def _apply(self, proposal: Proposal, verdict: reasoning.Verdict) -> str:
+    def _apply(
+        self,
+        proposal: Proposal,
+        verdict: reasoning.Verdict,
+        sources: tuple[reasoning.ReviewSource, ...] = (),
+    ) -> str:
+        expected = {source.name: source.source_hash for source in sources}
         if proposal.kind == PROPOSAL_MERGE:
-            return self._merge(proposal, verdict)
+            return self._merge(proposal, verdict, expected)
         if proposal.kind == PROPOSAL_SUPERSEDE:
-            return self._supersede(proposal)
+            return self._supersede(proposal, expected)
         if proposal.kind == PROPOSAL_SPLIT:
-            return self._split(proposal, verdict)
+            return self._split(proposal, verdict, expected)
         if proposal.kind == PROPOSAL_DELETE:
-            return self._delete(proposal)
-        return self._rewrite_abstract(proposal, verdict.text)
+            return self._delete(proposal, expected)
+        return self._rewrite_abstract(proposal, verdict.text, expected)
 
-    def _merge(self, proposal: Proposal, verdict: reasoning.Verdict) -> str:
+    def _merge(
+        self, proposal: Proposal, verdict: reasoning.Verdict, expected: dict[str, str]
+    ) -> str:
         """The reasoner writes the knowledge; the library computes time, identity, evidence."""
         if not verdict.abstract.strip() or not verdict.body.strip():
             raise ValidationError(
@@ -260,20 +342,31 @@ class Manage:
         if self._store.find(name) is not None:
             name += "-" + self._clock.stamp().lower()
         merged = self._store.merge(
-            [record.name for record in entries], verdict.abstract, verdict.body, name=name
+            [record.name for record in entries],
+            verdict.abstract,
+            verdict.body,
+            name=name,
+            expected_source_hashes=expected,
         )
         return f"merged into {merged.name}"
 
-    def _supersede(self, proposal: Proposal) -> str:
+    def _supersede(self, proposal: Proposal, expected: dict[str, str]) -> str:
         entries = [self._entry(name) for name in proposal.targets]
         keeper = max(entries, key=lambda record: (len(record.body), record.created, record.name))
         for record in entries:
             if record.name == keeper.name:
                 continue
-            self._store.supersede(record.name, keeper.name)
+            self._store.supersede(
+                record.name,
+                keeper.name,
+                expected_source_hash=expected.get(record.name),
+                expected_successor_hash=expected.get(keeper.name),
+            )
         return f"kept {keeper.name}"
 
-    def _split(self, proposal: Proposal, verdict: reasoning.Verdict) -> str:
+    def _split(
+        self, proposal: Proposal, verdict: reasoning.Verdict, expected: dict[str, str]
+    ) -> str:
         """The original keeps its name as the first part; every other part is a new file."""
         parts = [part for part in verdict.parts if part.abstract.strip() and part.body.strip()]
         if len(parts) < len(("first", "second")):
@@ -281,6 +374,7 @@ class Manage:
                 [FieldError("parts", "accepting a split needs at least two parts with content")]
             )
         original = self._entry(proposal.targets[0])
+        original.source_hash = expected.get(original.name, original.source_hash)
         own = set(original.provenance)
         now = self._clock.timestamp()
         names = []
@@ -309,16 +403,18 @@ class Manage:
             names.append(written.name)
         return "split into " + ", ".join(names)
 
-    def _delete(self, proposal: Proposal) -> str:
-        removed = self._store.delete(proposal.targets[0])
+    def _delete(self, proposal: Proposal, expected: dict[str, str]) -> str:
+        name = proposal.targets[0]
+        removed = self._store.delete(name, expected_source_hash=expected.get(name))
         return f"marked {removed.name} invalid"
 
-    def _rewrite_abstract(self, proposal: Proposal, text: str) -> str:
+    def _rewrite_abstract(self, proposal: Proposal, text: str, expected: dict[str, str]) -> str:
         if not text.strip():
             raise ValidationError(
                 [FieldError("text", "accepting an abstract review needs the replacement abstract")]
             )
         record = self._entry(proposal.targets[0])
+        record.source_hash = expected.get(record.name, record.source_hash)
         record.abstract = text.strip()
         self._rewrite(record)
         return f"rewrote the abstract of {record.name}"
@@ -638,11 +734,17 @@ class Manage:
     def _write_report(self, report: DreamReport) -> str:
         folder = self._store.layout.dream_reports
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / (self._clock.stamp() + REPORT_SUFFIX)
+        filename = (
+            f"auto-{report.dream_id}{REPORT_SUFFIX}"
+            if report.dream_id
+            else (self._clock.stamp() + REPORT_SUFFIX)
+        )
+        path = folder / filename
         lines = [
             f"# dream report {report.at}",
             "",
             f"inspected: {report.inspected}",
+            f"dream_id: {report.dream_id}" if report.dream_id else "",
             "",
             "## applied",
             "",
@@ -652,7 +754,8 @@ class Manage:
         )
         lines.extend(["", "## decided", ""])
         lines.extend(
-            f"- {decision.proposal_id} {decision.verdict} — {decision.detail}"
+            f"- {decision.proposal_id} {decision.verdict}"
+            + (f" — {decision.detail}" if decision.detail else "")
             for decision in report.decisions
         )
         lines.extend(["", "## proposals (open)", ""])
@@ -664,7 +767,55 @@ class Manage:
         if report.withheld:
             lines.extend(["", "## withheld (over the cap or refused by the write path)", ""])
             lines.extend(f"- {proposal_id}" for proposal_id in report.withheld)
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if report.review is not None:
+            lines.extend(["", "## review execution", ""])
+            lines.extend(
+                [
+                    f"- submitted: {str(report.review.submitted).lower()}",
+                    f"- complete: {str(report.review.complete).lower()}",
+                    f"- rounds: {report.review.rounds}",
+                    f"- tool_calls: {report.review.tool_calls}",
+                    f"- duration_seconds: {report.review.duration_seconds:.3f}",
+                    f"- startup_seconds: {_seconds(report.review.startup_seconds)}",
+                    f"- model_wait_seconds: {_seconds(report.review.model_wait_seconds)}",
+                    f"- mcp_seconds: {_seconds(report.review.mcp_seconds)}",
+                    f"- shutdown_seconds: {_seconds(report.review.shutdown_seconds)}",
+                    f"- apply_seconds: {report.review.apply_seconds:.3f}",
+                    f"- model_requests: {_metric(report.review.model_requests)}",
+                    f"- agent_turns: {_metric(report.review.agent_turns)}",
+                    f"- input_tokens: {_metric(report.review.input_tokens)}",
+                    f"- cached_input_tokens: {_metric(report.review.cached_input_tokens)}",
+                    f"- output_tokens: {_metric(report.review.output_tokens)}",
+                    _report_values(
+                        "evidence_reads",
+                        (f"{proposal}/{name}" for proposal, name in report.review.evidence_reads),
+                    ),
+                    _report_values(
+                        "provenance_reads",
+                        (
+                            f"{proposal}/{name}/{pointer}"
+                            for proposal, name, pointer in report.review.provenance_reads
+                        ),
+                    ),
+                    _report_values(
+                        "tool_trace",
+                        (
+                            f"{name}{'!error' if failed else ''}"
+                            for name, failed in report.review.tool_trace
+                        ),
+                    ),
+                ]
+            )
+        rendered = "\n".join(lines) + "\n"
+        with tempfile.NamedTemporaryFile(
+            "w", dir=path.parent, delete=False, encoding="utf-8"
+        ) as temporary:
+            temporary.write(rendered)
+            staged = pathlib.Path(temporary.name)
+        try:
+            os.replace(staged, path)
+        finally:
+            staged.unlink(missing_ok=True)
         return str(path)
 
     def _commit(self, report: DreamReport) -> bool:
@@ -697,12 +848,63 @@ class Manage:
     def _last_sleep(self) -> dt.datetime | None:
         folder = self._store.layout.dream_reports
         reports = sorted(folder.glob("*" + REPORT_SUFFIX)) if folder.exists() else []
-        for path in reversed(reports):
+        found: list[dt.datetime] = []
+        for path in reports:
             try:
-                return dt.datetime.strptime(path.stem, STAMP_FORMAT).replace(tzinfo=dt.UTC)
+                found.append(dt.datetime.strptime(path.stem, STAMP_FORMAT).replace(tzinfo=dt.UTC))
             except ValueError:
-                continue
+                try:
+                    heading = path.read_text(encoding="utf-8").splitlines()[0]
+                    found.append(timestamp.parse(heading.removeprefix("# dream report ").strip()))
+                except (OSError, IndexError, ValueError):
+                    continue
+        return max(found) if found else None
+
+    def last_sleep(self) -> dt.datetime | None:
+        """Latest completed report, including stable-id reports from automatic workers."""
+        return self._last_sleep()
+
+
+def _review_dict(outcome: reasoning.ReviewOutcome | None) -> dict[str, object] | None:
+    if outcome is None:
         return None
+    return {
+        "mode": outcome.mode,
+        "submitted": outcome.submitted,
+        "complete": outcome.complete,
+        "rounds": outcome.rounds,
+        "tool_calls": outcome.tool_calls,
+        "duration_seconds": outcome.duration_seconds,
+        "startup_seconds": outcome.startup_seconds,
+        "model_wait_seconds": outcome.model_wait_seconds,
+        "mcp_seconds": outcome.mcp_seconds,
+        "shutdown_seconds": outcome.shutdown_seconds,
+        "apply_seconds": outcome.apply_seconds,
+        "model_requests": outcome.model_requests,
+        "agent_turns": outcome.agent_turns,
+        "input_tokens": outcome.input_tokens,
+        "cached_input_tokens": outcome.cached_input_tokens,
+        "output_tokens": outcome.output_tokens,
+        "evidence_reads": [list(item) for item in outcome.evidence_reads],
+        "provenance_reads": [list(item) for item in outcome.provenance_reads],
+        "tool_trace": [
+            {"name": name, "is_error": is_error} for name, is_error in outcome.tool_trace
+        ],
+        "error": outcome.error,
+    }
+
+
+def _metric(value: int | None) -> str:
+    return str(value) if value is not None else "unavailable"
+
+
+def _seconds(value: float | None) -> str:
+    return f"{value:.3f}" if value is not None else "unavailable"
+
+
+def _report_values(label: str, values: Iterable[str]) -> str:
+    rendered = ", ".join(values)
+    return f"- {label}:" + (f" {rendered}" if rendered else "")
 
 
 def _tokens(text: str) -> set[str]:

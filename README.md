@@ -225,11 +225,136 @@ Codex keeps its normal MCP approval boundary; the first tool call can still requ
 user approval even after setup has configured and verified the server.
 
 SessionStart injects, Stop and SessionEnd distil where supported, and PreCompact evicts.
-Distillation reasons through the host that fired the boundary, using its existing login. Point
-`[executor]` in Store `config.toml` at a model endpoint instead to use an endpoint reasoner.
-Endpoint use is opt-in and never carries a Tigerless project or credential. A failed host,
-credential, request, or endpoint response is reported and leaves the archived backlog eligible
-for retry. Detached boundary failures are recorded in the Store's `.state/hooks.log`.
+By default, Write reasons through the host that produced the source session while Manage uses
+the Store's legacy `[executor]` policy. They can be configured independently without changing
+which source session is archived or cited:
+
+```toml
+[executor.write]
+reasoner = "host"
+host = "muse-code" # or "source", "hermes", "codex", or "claude-code"
+host_provider = "" # Hermes can pin "openrouter" independently of its model
+tool_mode = "auto" # supported Hosts use native tools; use "text" for compatibility
+
+[executor.manage]
+reasoner = "host"
+host = "muse-code" # native Manage supports "codex", "hermes", and "muse-code"
+tool_mode = "text" # set "native" for the experimental bounded Host reviewer
+timeout_seconds = 120
+
+[manage]
+# Experimental: let Native Manage inspect only raw Session pointers already cited by a target.
+# This sends those cited historical messages to the configured review model when it requests them.
+review_raw_session_evidence = false
+```
+
+For `mem distill` and `mem sleep`, `--reason`, `--reason-host`, and `--reason-model` override the
+corresponding operation policy. Operation policy overrides legacy `[executor]` values. Hooks pass
+the producing host only as `--source-host`, so it supplies the default or resolves `host =
+"source"` but never replaces an explicit Write host. A headless reasoner carries an executor
+marker that prevents recursive capture.
+
+Write runs the reasoner as a standard tool-use agent over one toolkit — `recall`, `read`, and
+`submit_operations`. An endpoint reasoner drives that loop through native function calling.
+Claude Code, Codex, Hermes, and Muse Code run their own loop in one headless process per batch by
+default: the toolkit is served by a per-batch stdio MCP server, their built-in tools, user
+configuration and native memory are off, and the distillation instructions replace their system
+prompt where the Host supports replacement. Hermes and Muse use one combined prompt file and an
+isolated process with only that batch's MCP `recall`, `read`, and `submit_operations` tools. Muse native
+mode requires Muse Code 1.4.4 or newer, caps a run at eight model steps, and fails explicitly on
+older versions; it never falls back to text. When Muse is routed through the supported local
+pproxy bridge, a scoped loopback
+adapter expands Responses API namespace tools to Muse's canonical MCP ids; it neither executes
+tools nor holds credentials. Hermes uses a temporary profile, an exact dynamic MCP toolset,
+and a provider selected independently of the model; OpenRouter therefore needs no Vertex project
+or gcloud authentication. `tool_mode = "text"` forces the compatibility protocol for a Host. A run that ends
+without an accepted submission writes nothing and leaves the backlog for retry.
+
+Manage keeps the text-verdict path by default. An explicit
+`[executor.manage] tool_mode = "native"` selects the experimental Codex, Hermes, or Muse reviewer.
+It starts one isolated Host process with only `list_proposals`, `read_evidence`, and
+`submit_verdicts`; proposal summaries arrive first and bodies are opened on demand. These tools
+cannot record, correct, supersede, merge, delete, or access arbitrary paths. A complete structured
+submission returns to the existing Manage cap, open-proposal, source-hash, `decide()`, Store,
+Ledger, and Dream Report path. Missing or stale submissions fail the run without a success report
+or transport fallback. Endpoint Manage and Claude Code remain on text mode. Review tool calls,
+evidence reads, wall time, and Host token/cache totals (when its output supplies them) are
+recorded in the report. For Codex JSONL runs, wall time is also divided into startup (launch to
+the first lifecycle event), MCP call intervals, shutdown (completed turn to exit), and the
+remaining model/runtime wait; verdict application is timed separately inside Manage. These are
+latency diagnostics, not model-provider server timings. `manage.review_max_tool_calls`,
+`manage.review_tool_result_chars`, and
+`manage.review_evidence_chars` bound tool use; the executor timeout remains the hard process bound.
+Raw Session inspection is a separate experimental permission and remains off even when Manage
+uses `tool_mode = "native"`. Setting `manage.review_raw_session_evidence = true` lets
+`read_evidence` open only a complete Session pointer frozen on that proposal's target Memory. It
+does not permit Session search, neighboring messages, unrelated Memories, Recall, or mutation.
+Returned role and message time are archived metadata, not proof that a fact is true, confirmed, or
+effective at that time. The Memory Source Hash covers the provenance pointer but not the referenced
+Session file bytes, so this boundary does not defend against out-of-band malicious modification of
+historical files on the Store filesystem.
+
+Either operation can select its own model endpoint by setting `reasoner = "endpoint"` and the
+usual `model`, `endpoint`, `project`, `location`, or `timeout_seconds` values in that operation's
+table. Unset operation values inherit the legacy `[executor]` value, preserving existing Store
+configuration. Endpoint use is opt-in and never carries a Tigerless project or credential. A
+failed selected host, credential, request, or endpoint response never switches transport; Write
+leaves the original archived backlog eligible for retry. Detached boundary failures are recorded
+in the Store's `.state/hooks.log`.
+
+After a boundary Distillation catches up, the same short-lived process checks whether Manage is
+due. It counts distinct completed sessions, waits for all captured Write work to settle, claims the
+Dream once across Hosts, and starts a detached one-shot worker using the configured Manage
+reasoner. The source Host never overrides `[executor.manage]`. The worker enters the same
+`Manage.sleep()` T0/T1 pipeline as manual sleep, writes the normal Dream report and decision
+ledger, then exits. Repeated Stop, SessionEnd, or PreCompact events do not inflate progress or
+duplicate the Dream. Inspect an active claim or failure with `mem --json dream-status`; a later
+lifecycle event retries failed or stale work. Manual `mem sleep` remains available and always
+runs when explicitly requested.
+
+Automatic Dreaming is enabled by `manage.auto_dream` and can be rolled back by setting it to
+`false`. `manage.claim_lease_seconds` controls crash-recovery eligibility. Default setup installs
+no timer or resident Memory process: if every Host is inactive when the time threshold passes,
+work runs only after the next SessionStart or boundary event. An explicitly installed user cron
+entry can provide an independent wall-clock wake-up.
+
+An external scheduler can supply that optional wake-up without running a Memory Backend. The
+due-aware command derives new completed sessions and elapsed time from Store state; it does not
+accept a caller-provided session count:
+
+```bash
+# Install the default hourly check for one initialized Store.
+mem --store /absolute/path/to/store --json cron install \
+  --mem-path /absolute/path/to/mem
+
+# Or check every 15 minutes. Repeating install updates the same Store entry.
+mem --store /absolute/path/to/store --json cron install \
+  --interval-minutes 15 --mem-path /absolute/path/to/mem
+
+# If the configured Reasoner needs environment-only settings, source a private file.
+chmod 600 /absolute/path/to/reasoner.env
+mem --store /absolute/path/to/store --json cron install \
+  --mem-path /absolute/path/to/mem --env-file /absolute/path/to/reasoner.env
+
+# Inspect the managed entry and whether cron is running, then remove only this Store's entry.
+mem --store /absolute/path/to/store --json cron status
+mem --store /absolute/path/to/store --json cron remove
+```
+
+The installer writes one Store-identified block to the current user's crontab and preserves all
+unrelated entries. It records absolute Store and `mem` paths, `HOME`, and `PATH`, quotes spaces and
+cron-special percent characters, and appends output to `STORE/.state/cron.log` by default. It does
+not copy secrets into the crontab: Codex and Muse should use their normal files under `HOME`;
+environment-only proxy or endpoint settings can come from an explicit mode-600 `--env-file`, whose
+contents are never included in CLI diagnostics. On WSL, status
+warns when the distribution's cron service is not running. Unsupported systems report that
+`crontab` is unavailable instead of pretending scheduling is active.
+
+A not-due invocation returns `status: skipped` and creates no report. Hook and cron triggers share
+the Store claim/lease, maintenance locks, reasoner selection, and `Manage.sleep()` runner, so a
+concurrent wake-up can produce only one effective Dream. The check interval is only a wake-up
+frequency: a Dream still requires the configured elapsed-time and completed-session thresholds.
+Installing, updating, or removing cron never disables lifecycle Hook triggering.
 
 To use Vertex AI, enable it in a Google Cloud project you control, grant the calling identity
 prediction access, authenticate the `gcloud` CLI, and configure that project explicitly:
@@ -242,10 +367,65 @@ location = "global"
 model = "google/gemini-3.7-flash"
 ```
 
+The legacy form above continues to apply to both operations unless an operation table overrides
+it. Put the same endpoint fields under `[executor.write]` or `[executor.manage]` to scope them.
+`mem setup` and `mem doctor` report configuration and live-preflight results separately as Write
+and Manage reasoner checks.
+
 `GOOGLE_CLOUD_PROJECT` and `VERTEX_LOCATION` override the Store values. Alternatively, an
 OpenAI-compatible endpoint can be selected with `endpoint` and a `GEMINI_API_KEY` supplied in
 the environment. Store configuration contains no secret, and service-account keys must not be
 committed to the repository.
+
+### Hermes Agent
+
+Hermes native Write and Manage require Hermes Agent 0.22.2 or newer. Hermes may still use Gemini/Vertex,
+but it is not coupled to it. To run Hermes through OpenRouter without gcloud, export the key and
+pin the provider and model in the Write policy:
+
+```bash
+export OPENROUTER_API_KEY="..."
+```
+
+```toml
+[executor.write]
+reasoner = "host"
+host = "hermes"
+host_provider = "openrouter"
+host_model = "meta/muse-spark-1.3-contributor"
+host_allow_data_training = true # required explicit consent for contributor-tier data use
+tool_mode = "auto"
+```
+
+Each Write batch gets a fresh Hermes profile containing only an `agent-memory-write` stdio MCP
+server.
+The exact toolset prevents Shell, Web, Hermes memory, skills, delegation, plugins, and personal
+MCP servers from entering the run. Secrets remain in the process environment and are never
+written to the temporary profile. `tool_mode = "text"` explicitly retains the compatibility
+loop; native failures never switch to it automatically.
+
+The contributor model permits Meta to use prompts and completions for training. Memory refuses
+Hermes' unattended contributor route unless `host_allow_data_training = true` is explicitly set;
+use the non-contributor model for sensitive or proprietary sessions.
+
+Native Manage uses the same isolated Hermes execution stack with a distinct
+`agent-memory-manage` stdio MCP server and the three bounded review tools. Configure its provider,
+model, and contributor consent independently; consent under `[executor.write]` does not enable
+Manage:
+
+```toml
+[executor.manage]
+reasoner = "host"
+host = "hermes"
+host_provider = "openrouter"
+host_model = "meta/muse-spark-1.3-contributor"
+host_allow_data_training = true # sends Manage review material to a training-eligible tier
+tool_mode = "native"
+```
+
+Hermes reads OpenRouter authentication from `OPENROUTER_API_KEY`. Muse and Hermes may use the same
+key, but agent-memory does not silently copy Muse's credential store into Hermes. Export the key
+explicitly, or inject it into the isolated Hermes process through an authorized test harness.
 
 ### Muse Code
 
@@ -295,68 +475,6 @@ one explicit experiment workspace. It never adds `--yolo` or `--disable-sandbox`
 AGENT_MEMORY_LIVE_MUSE=1 uv run python tools/muse_sandbox_probe.py
 ```
 
-#### Muse SDK / `muse serve`
-
-SDK applications do not need a manually managed backend or the persistent pproxy process used by
-the interactive setup above. From the SDK application directory, run the managed bootstrap once:
-
-```bash
-export OPENROUTER_API_KEY="..."  # preferably injected by the application's secret manager
-mem setup --host muse-code --provider openrouter --sdk
-```
-
-The command initializes the selected Store, checks Muse, Node 20+, the project-local
-`@muse-code/sdk`, the managed launcher, credential availability, and version compatibility, then
-performs one real request through the same invocation-scoped bridge used by the SDK. It prints the
-absolute `museBin` and arguments to use. It does not modify persistent Muse settings or auth, start
-a persistent pproxy, edit `package.json`, or install system software. When a dependency is absent,
-the failed check includes the exact next command; rerun bootstrap after applying it.
-Run it from the application workspace, not from a workspace nested under the system temporary
-directory: Muse requires its process-lifetime tool-output directory to live outside the workspace.
-
-`OPENROUTER_API_KEY` must be present in the environment of both bootstrap and the application
-process. In production, inject it with the application's secret manager. For a local shell, avoid
-putting the key on a command line or in shell history:
-
-```bash
-read -rsp 'OpenRouter API key: ' OPENROUTER_API_KEY
-echo
-export OPENROUTER_API_KEY
-mem setup --host muse-code --provider openrouter --sdk
-node app.mjs
-unset OPENROUTER_API_KEY
-```
-
-An existing Muse `meta` or `openrouter` credential is also recognized, so the environment variable
-can be omitted in that case. Use the bootstrap result as the SDK launch contract:
-
-```js
-import { MuseClient } from "@muse-code/sdk";
-
-const client = await MuseClient.spawn({
-  museBin: "/absolute/path/printed/by/bootstrap/mem-muse",
-  args: ["serve"],
-  env: process.env,
-  clientInfo: { name: "my_app", version: "1.0.0" },
-});
-const session = await client.startSession({ workspaceRoot: process.cwd() });
-// Send turns through session, then release the owned backend.
-await client.close();
-```
-
-`mem-muse` initializes the selected Store, creates a private invocation configuration, installs
-the lifecycle hooks and skill, enables `mem-mcp` when that optional executable is installed,
-serves the Muse model catalog through an invocation-scoped OpenRouter bridge, and starts the real
-`muse serve`. It leaves the user's Muse settings and auth file unchanged. SDK close and startup
-failure both tear down Muse, the generated credential copy, and the bridge; detached distillation
-starts a fresh hook-free `mem-muse exec`, so it neither depends on the parent backend nor recurses.
-
-The SDK requires Node 20 or newer. Pin `@muse-code/sdk` to the Muse Code CLI version because they
-ship in lockstep. Bootstrap rejects major or minor version skew. Patch skew is reported as an
-advisory warning and must still pass the live request. OpenRouter can reject an otherwise valid
-request when the selected model is unavailable for the account or region; the Store hook log
-retains that redacted upstream error and the archived session remains eligible for retry.
-
 Start with the three ordered portability mechanics before a full four-host matrix:
 
 ```bash
@@ -367,16 +485,20 @@ mem-exp interop --workspace /tmp/muse-memory-smoke \
 Then omit `--pairs` and pass `--hosts claude-code,codex,hermes,muse-code` for the 4×4 matrix.
 Current limitations: only the root Muse session log is captured; child/observer logs are ignored,
 setup installs MCP only when `--mcp` is requested, and live hook/MCP/sandbox behavior must be
-verified on a machine with Muse Code installed and authenticated. Muse 1.4.3 with the tested
-OpenRouter model may shorten a fully qualified MCP tool ID to `memory_recall`; Muse rejects that
-shorthand even though the configured server handshake succeeds. Lifecycle hooks and SessionStart
-injection do not depend on that optional model-driven MCP call. A missing Muse login is reported
-as `BLOCKED_BY_MUSE_AUTH`; echo or mocked providers do not count as live E2E evidence.
+verified on a machine with Muse Code installed and authenticated. Muse 1.4.3 does not support the
+exact `run.toolset` MCP selection required by native Write mode. Muse 1.4.9 plus OpenRouter emits
+Responses namespace calls as a namespace and child name while Muse dispatches canonical flat MCP
+ids; native Write bridges that local pproxy transport for the duration of the run. The live matrix
+is opt-in with `AGENT_MEMORY_LIVE_MUSE_NATIVE=1`, selects Muse through the default `auto` posture,
+and covers New, Recall/Read/Supersede, Skip, and tool-error observation. Lifecycle hooks and
+SessionStart injection do not depend on native Write.
+Echo or mocked providers do not count as live E2E evidence.
 
 ## Let it sleep
 
 ```bash
 mem sleep                 # host-backed consolidation; T0 applies, T1 files a proposal
+mem sleep --if-due        # persisted thresholds; skip normally when not due
 mem proposals             # what is waiting on you
 mem decide <id> --accept
 ```
@@ -399,6 +521,9 @@ BM25 is the low-latency baseline retrieval path. Install `agent-memory-core[vect
 in the store's `[index]` configuration. `vector_model` defaults to
 `BAAI/bge-small-en-v1.5`. The first enabled Store loads FastEmbed/ONNX and may
 need network access to download the model; disabled stores never load FastEmbed.
+Set `AGENT_MEMORY_OFFLINE=1` to load strictly from the FastEmbed cache
+(`FASTEMBED_CACHE_PATH`, default `~/.cache/fastembed_cache` on most systems) —
+useful for air-gapped hosts or caches populated from a mirror.
 
 Run `mem --store /path/to/store rebuild` to rebuild the SQLite cache from Markdown.
 The existing indexing path catches changed and deleted files, enabling vectors
@@ -415,6 +540,33 @@ a retrieval-coverage/latency trade-off. Fixed-context answer replays scored
 17/24 versus 18/24 and, on the expanded set, 28/36 versus 27/36. The existing
 answer-level experiments do not establish an end-to-end accuracy improvement,
 so vector retrieval remains optional.
+
+## CJK (Chinese) memory
+
+The default tokenizer extracts ASCII literals only, and the FTS5 unicode61
+tokenizer keeps an unsegmented CJK run as one token, so a Chinese query matches
+nothing a Chinese body wrote. Install `agent-memory-core[cjk]` (or run
+`uv sync --extra cjk` from this workspace) and set `tokenizer = "cjk"` in the
+store's `[index]` configuration:
+
+```toml
+[index]
+tokenizer = "cjk"
+vector_enabled = true
+vector_model = "BAAI/bge-small-zh-v1.5"
+```
+
+`cjk` segments chunk text with jieba before it enters the FTS5 projection and
+adds CJK words (two or more characters) to the query expression; ASCII literals
+keep their current behavior. Headings stay untouched — they are read back from
+the surface. The tokenizer the projection was built with is recorded in
+`index_meta`; changing it is detected on the next sync and the whole projection
+rebuilds, so no stale FTS rows survive a switch. For paraphrased Chinese queries
+that share no surface tokens with the memory, pair the tokenizer with the
+optional vector index and a Chinese-capable model such as
+`BAAI/bge-small-zh-v1.5`. On a 5-memory / 10-query Chinese check, ASCII-only
+recall answered 2/10, the cjk tokenizer 9/10, and cjk plus Chinese vectors
+10/10.
 
 ## Explicit raw evidence reads
 

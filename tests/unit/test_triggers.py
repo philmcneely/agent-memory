@@ -5,6 +5,7 @@ import json
 from agent_memory.adapters import capture as capture_module
 from agent_memory.cli.main import main
 from agent_memory.core import triggers
+from agent_memory.core.config import OperationExecutorConfig
 from agent_memory.core.errors import ReasonerUnavailableError
 from agent_memory.core.watermark import Mark, Watermark
 
@@ -94,6 +95,38 @@ def test_the_distill_command_runs_the_executor_over_a_named_session(store, monke
     assert report["distilled"][0]["reason"] == triggers.REASON_BOUNDARY
     assert report["distilled"][0]["batches"][0]["written"] == ["deploy-day"]
     assert Watermark(store.layout).read("hooked").distilled == len(LINES)
+
+
+def test_cross_host_write_keeps_source_session_provenance(store, monkeypatch, capsys):
+    capture_module.capture(store, "codex-source", LINES)
+    store.config.executor.write = OperationExecutorConfig(reasoner="host", host="muse-code")
+    store.config.save(store.root)
+    selected = []
+
+    def chosen(config):
+        selected.append(config)
+        return lambda _prompt: _spec("deploy day", "Deploys happen on Fridays", "0")
+
+    monkeypatch.setattr("agent_memory.executor.distiller.distiller", chosen)
+
+    code = main(
+        [
+            "--store",
+            str(store.root),
+            "--json",
+            "distill",
+            "--session",
+            "codex-source",
+            "--source-host",
+            "codex",
+        ]
+    )
+
+    assert code == 0
+    assert selected[0].host == "muse-code"
+    assert store.read("deploy-day").record.provenance == ["sessions/codex-source#0-0"]
+    assert not (store.layout.sessions / "muse-code.jsonl").exists()
+    capsys.readouterr()
 
 
 def test_a_reasoner_failure_is_reported_and_leaves_the_backlog_unsettled(

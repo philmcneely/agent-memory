@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ from agent_memory.core.errors import FieldError, ValidationError
 from . import moments
 
 HOOK_COMMAND = "mem-hook"
+WINDOWS_PLAIN_WORD = re.compile(r"[\w./:+=@-]+")
 HOST_FLAG = "--host"
 CLAUDE_SETTINGS = pathlib.Path("~/.claude/settings.json")
 CODEX_SETTINGS = pathlib.Path("~/.codex/hooks.json")
@@ -36,8 +38,6 @@ ALIASES = {"muse": moments.HOST_MUSE_CODE}
 MUSE_SCHEMA_VERSION = 1
 MUSE_DATA_HOME_FLAG = "--muse-data-home"
 MUSE_SETTINGS_FLAG = "--muse-settings"
-MUSE_LAUNCHER_FLAG = "--muse-launcher"
-MUSE_BINARY_FLAG = "--muse-binary"
 STORE_FLAG = "--store"
 MCP_SERVER = "agent-memory"
 MCP_COMMAND = "mem-mcp"
@@ -104,11 +104,7 @@ def install(
     *,
     provider: str | None = None,
     model: str | None = None,
-    provider_url: str | None = None,
-    muse_launcher: pathlib.Path | None = None,
-    muse_binary: pathlib.Path | None = None,
     mcp: bool = False,
-    lifecycle: bool = True,
 ) -> pathlib.Path:
     host = canonical_host(host)
     target = settings_path or default_settings_path(host)
@@ -119,41 +115,27 @@ def install(
         if provider:
             from . import openrouter
 
-            openrouter.merge_routing(
-                settings,
-                provider=provider,
-                model=model,
-                **({"proxy_url": provider_url} if provider_url else {}),
-            )
+            openrouter.merge_routing(settings, provider=provider, model=model)
         if mcp:
             _merge_json_mcp(settings, host, store_root)
-    if lifecycle:
-        hooks = settings.setdefault(HOOKS_KEY, {})
-        if not isinstance(hooks, dict):
-            raise ValidationError([FieldError("settings.hooks", "must be an object")])
-        entry = {
-            MATCHER_KEY: ANY_MATCHER,
-            HOOKS_KEY: [
-                {
-                    "type": "command",
-                    "command": hook_command(
-                        host,
-                        store_root,
-                        settings_path=target,
-                        muse_launcher=muse_launcher,
-                        muse_binary=muse_binary,
-                    ),
-                }
-            ],
-        }
-        for event in moments.DIALECTS[host]:
-            entries = hooks.get(event, [])
-            if not isinstance(entries, list):
-                raise ValidationError(
-                    [FieldError(f"settings.hooks.{event}", "must be an array")]
-                )
-            kept = [existing for existing in entries if not _mentions_command(existing)]
-            hooks[event] = [*kept, entry]
+    hooks = settings.setdefault(HOOKS_KEY, {})
+    if not isinstance(hooks, dict):
+        raise ValidationError([FieldError("settings.hooks", "must be an object")])
+    entry = {
+        MATCHER_KEY: ANY_MATCHER,
+        HOOKS_KEY: [
+            {
+                "type": "command",
+                "command": hook_command(host, store_root, settings_path=target),
+            }
+        ],
+    }
+    for event in moments.DIALECTS[host]:
+        entries = hooks.get(event, [])
+        if not isinstance(entries, list):
+            raise ValidationError([FieldError(f"settings.hooks.{event}", "must be an array")])
+        kept = [existing for existing in entries if not _mentions_command(existing)]
+        hooks[event] = [*kept, entry]
     rendered = json.dumps(settings, indent=SETTINGS_INDENT, sort_keys=True) + "\n"
     if not target.exists() or target.read_text(encoding="utf-8") != rendered:
         _atomic_write(target, rendered)
@@ -168,22 +150,34 @@ def hook_command(
     store_root: pathlib.Path | None = None,
     *,
     settings_path: pathlib.Path | None = None,
-    muse_launcher: pathlib.Path | None = None,
-    muse_binary: pathlib.Path | None = None,
 ) -> str:
     """By absolute path: desktop clients run hooks without the user's shell PATH."""
-    command = [str(pathlib.Path(sys.executable).parent / HOOK_COMMAND), HOST_FLAG, host]
+    hook = pathlib.Path(sys.executable).parent / _entry_point(HOOK_COMMAND)
+    command = [str(hook), HOST_FLAG, host]
     if host == moments.HOST_MUSE_CODE:
         command += [MUSE_DATA_HOME_FLAG, str(_muse_data_home())]
         target = settings_path or default_settings_path(host)
         command += [MUSE_SETTINGS_FLAG, str(target.expanduser().resolve())]
-        if muse_launcher is not None:
-            command += [MUSE_LAUNCHER_FLAG, str(muse_launcher.expanduser().resolve())]
-        if muse_binary is not None:
-            command += [MUSE_BINARY_FLAG, str(muse_binary.expanduser().resolve())]
     if store_root is not None:
         command += [STORE_FLAG, str(pathlib.Path(store_root).resolve())]
-    return shlex.join(command)
+    return render_command(command)
+
+
+def render_command(command: list[str]) -> str:
+    """Windows hosts run hooks through Git Bash, PowerShell or cmd; plain forward-slash words
+    mean the same in all three."""
+    if sys.platform != "win32":
+        return shlex.join(command)
+    return " ".join(_windows_word(part) for part in command)
+
+
+def _windows_word(part: str) -> str:
+    word = part.replace("\\", "/")
+    return word if WINDOWS_PLAIN_WORD.fullmatch(word) else f'"{word}"'
+
+
+def _entry_point(name: str) -> str:
+    return f"{name}.exe" if sys.platform == "win32" else name
 
 
 def skill_path(host: str, settings_path: pathlib.Path | None = None) -> pathlib.Path:
@@ -193,7 +187,7 @@ def skill_path(host: str, settings_path: pathlib.Path | None = None) -> pathlib.
 
 def mcp_binary() -> str:
     """Use the sibling entry point for the same reason hooks use an absolute path."""
-    return str(pathlib.Path(sys.executable).parent / MCP_COMMAND)
+    return str(pathlib.Path(sys.executable).parent / _entry_point(MCP_COMMAND))
 
 
 def _merge_json_mcp(

@@ -202,7 +202,7 @@ def test_the_slot_table_and_the_event_lane_are_write_options(store):
     messages = _messages(store)
     store.config.write.slot_table = False
     store.config.write.event_lane = False
-    ask = _replies([])
+    ask = _replies([_spec(op="skip")])
     distill.distill(store, "boundary", messages, ask)
     assert prompts.EVENT_LANE not in ask.prompts[0]
     assert prompts.SLOT_INSTRUCTION not in ask.prompts[0]
@@ -211,7 +211,7 @@ def test_the_slot_table_and_the_event_lane_are_write_options(store):
 
     store.config.write.slot_table = True
     store.config.write.event_lane = True
-    ask = _replies([])
+    ask = _replies([_spec(op="skip")])
     distill.distill(store, "boundary", _messages(store, lines=["user: more"]), ask)
     assert prompts.EVENT_LANE in ask.prompts[0]
     assert prompts.SLOT_INSTRUCTION in ask.prompts[0]

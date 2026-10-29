@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import pathlib
 
+from agent_memory.core.config import REASONER_HOST, OperationExecutorConfig
 from agent_memory.core.errors import FieldError, ValidationError
 from agent_memory.core.store import Store
 
-from . import doctor, moments, muse_sdk, openrouter, setup
+from . import doctor, moments, openrouter, setup
 
 
 def run(
@@ -19,26 +20,9 @@ def run(
     model: str | None = None,
     mcp: bool = False,
     live: bool = True,
-    sdk: bool = False,
 ) -> dict[str, object]:
     """Detect -> validate -> Store -> merge -> hooks/skill/MCP -> provider -> preflight."""
     host = setup.canonical_host(host)
-    if sdk:
-        if host != moments.HOST_MUSE_CODE or provider != openrouter.PROVIDER:
-            raise ValidationError(
-                [FieldError("sdk", "requires --host muse-code --provider openrouter")]
-            )
-        if settings_path is not None or mcp:
-            raise ValidationError(
-                [
-                    FieldError(
-                        "sdk",
-                        "uses invocation-scoped settings and automatic MCP; "
-                        "omit --settings and --mcp",
-                    )
-                ]
-            )
-        return muse_sdk.run(store, provider=provider, model=model, live=live)
     if provider and host != moments.HOST_MUSE_CODE:
         raise ValidationError(
             [FieldError("provider", "provider setup is currently supported only for muse-code")]
@@ -65,6 +49,16 @@ def run(
         mcp_failed = any(item.field == "mcp" for item in error.errors)
         code = "MCP_INVALID" if mcp_failed else "HOST_CONFIG_INVALID"
         return _failed(host, store, target, code, str(error), version=version)
+    seeded_manage = (
+        store.config.executor.reasoner == REASONER_HOST
+        and store.config.executor.manage == OperationExecutorConfig()
+    )
+    if seeded_manage:
+        store.config.executor.manage = OperationExecutorConfig(
+            reasoner=REASONER_HOST,
+            host=host,
+        )
+        store.config.save(store.root)
     provider_status: dict[str, object] | None = None
     if provider == openrouter.PROVIDER:
         credential = openrouter.detect_credential()
@@ -91,6 +85,9 @@ def run(
         mcp=mcp,
         live=live,
     )
+    if seeded_manage and report.status != doctor.READY:
+        store.config.executor.manage = OperationExecutorConfig()
+        store.config.save(store.root)
     payload = report.as_dict()
     payload.update(
         {

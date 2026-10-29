@@ -20,21 +20,50 @@
   bounds are needed; current correct replaces the complete list.
 - Review recovery of interrupted multi-file operations outside Git-backed stores.
 
+## Platform follow-ups
+
+- Render setup/doctor checks as code, status and detail in text mode; the recall-hit line
+  renderer prints them as empty `name — abstract · path · score=None` rows on every platform.
+- Pass the Claude Code text-protocol system prompt by file as the tool posture already does;
+  an inline argument can exceed the Windows command-line limit for long prompts.
+- Confirm on a live Codex Windows install which shell runs user hooks and that the rendered
+  hook command executes there after the one-time trust review.
+
 ## Executor follow-ups
 
-- Replace the host-CLI reasoner with an executor-owned agent loop: native tool use, a
-  persisted per-run trace (messages, tool calls, operations, usage), explicit prompt caching,
-  a context provider per job, and a durable job queue in place of the fire-and-forget launch.
-  The host CLI stays the zero-key fallback.
-- Boundary distillation through the host CLI takes 80–100 s per boundary on Haiku (three
-  negotiation rounds, one cold process each); measure again once the executor loop lands.
-- Verify the Codex dialect end to end, including the one-time hook trust review; it is
-  covered by unit tests only.
+- Persist a per-run Write trace (messages, tool calls, operations, usage), add explicit cache
+  breakpoints for endpoints that need them, a context provider per job, and a durable job queue
+  in place of the fire-and-forget launch.
+- Keep the authenticated Hermes/OpenRouter native Write matrix in the release checks; ordinary CI
+  exercises the same process, stdio MCP, Store, provenance, Watermark, and fail-closed path with a
+  deterministic Host.
+- Harness Claude Code runs with tools enabled still load the user's MCP servers; on a machine
+  with many servers their tool definitions alone overflow Haiku's context, and any memory-like
+  server contaminates attribution. Decide strict MCP for harness runs and record the change in
+  the experiment ledger.
+- An announced future effective date ("from Saturday") is refused as a valid_from later than its
+  evidence; Haiku 4.5 and Gemini 2.5 Flash set one on about half their first submissions, which
+  costs a turn. Decide whether the Store accepts announced effective dates; a schema description
+  alone did not change model behaviour.
+- A decision and a fact with the same key fields derive the same name: the second write is
+  refused, and the text repair folded the decision into the fact (observed live with Codex,
+  2026-10-14). Names, or the collision rule, need to account for type.
+- Measure native-tool distillation on real boundaries and a write-side benchmark round. On one
+  fixed supersede scenario, Haiku took a median 14 s in one process against 33 s for the text
+  protocol (evidence: experiments/runs/native-tools-latency).
+- Haiku 4.5 sometimes closes a batch with nothing worth keeping in plain text instead of
+  submitting a Skip; the batch fails closed and succeeds on a later run (observed twice in three
+  Windows runs, 2026-10-22). Decide whether a no-submission answer should count as Skip.
+- Verify the Codex lifecycle hooks end to end, including the one-time hook trust review; the
+  Codex Write executor is verified live, the hooks by unit tests only.
 
 ## Muse Code follow-ups
 
-- Run the isolated Muse shell, lifecycle hook, and stdio MCP sandbox preflight on an installed,
-  authenticated Muse build, then record the observed compatibility result.
+- Muse Code 1.4.9 passed the OpenRouter/pproxy native Write matrix on 2026-10-16: New,
+  Recall/Read/Supersede, Skip, tool-error observation, Store/Provenance, and Watermark. The live
+  test is `AGENT_MEMORY_LIVE_MUSE_NATIVE=1 uv run pytest -q
+  tests/system/test_live_muse_native_write.py`. Keep this opt-in credentialed check in the release
+  matrix; ordinary CI covers the same MCP/Store chain with the deterministic Host.
 - Run Muse-to-Muse, Muse-to-Codex, and Codex-to-Muse portability smoke before the full four-host
   matrix.
 - Map `MUSE_SESSION_ID` into shared MCP source context only if provenance can accept it without a

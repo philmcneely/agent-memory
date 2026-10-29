@@ -2,7 +2,8 @@
 
 Store handles a batch under one writer lock. Invalid input rejects its own item with
 an index and field error; accepted siblings share one projection. Single-record
-writes use the same validation and persistence boundary.
+writes use the same validation and persistence boundary. A check prepares each item
+exactly as a write does and persists nothing, so its verdicts are the write's.
 
 An operational failure during writing or projection aborts the batch. Store restores
 touched canonical memory files to their pre-batch contents and projects the restored

@@ -100,9 +100,11 @@ class MemoryRecord:
             updated=str(raw.get("updated") or ""),
             body=body,
             valid_from=_optional_str(raw.get("valid_from")),
-            invalid_at=_optional_str(raw.get("invalid_at")) or (
+            invalid_at=_optional_str(raw.get("invalid_at"))
+            or (
                 _optional_str(raw.get("updated"))
-                if raw.get("status") in (STATUS_INVALID, "retired") else None
+                if raw.get("status") in (STATUS_INVALID, "retired")
+                else None
             ),
             superseded_by=_optional_str(raw.get("superseded_by")),
             weight=_as_float(raw.get("weight")),
@@ -112,6 +114,15 @@ class MemoryRecord:
             path=path,
             source_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         )
+
+    @classmethod
+    def from_file(cls, path: pathlib.Path) -> MemoryRecord:
+        """The source hash covers the bytes on disk, whatever line endings an editor left."""
+        raw = path.read_bytes()
+        text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        record = cls.from_text(text, path)
+        record.source_hash = hashlib.sha256(raw).hexdigest()
+        return record
 
 
 def validate(record: MemoryRecord, config: Config, schema: MemorySchema | None = None) -> None:
@@ -130,6 +141,13 @@ def validate(record: MemoryRecord, config: Config, schema: MemorySchema | None =
         errors.append(FieldError("abstract", "exceeds abstract_max_chars"))
     if "\n" in record.abstract:
         errors.append(FieldError("abstract", "must be a single line"))
+    for key, custom_value in record.fields.items():
+        # Custom fields ride the same line-based frontmatter dialect as the
+        # core fields: an embedded line break is silently truncated to the
+        # first line on the next read (splitlines() drops the rest), so
+        # reject it here just as loudly as for abstract.
+        if "\n" in str(custom_value) or "\r" in str(custom_value):
+            errors.append(FieldError(key, "must be a single line"))
     if record.type and not slug.is_valid_slug(record.type):
         errors.append(FieldError("type", "must be a kebab-case slug"))
     if schema is not None:
@@ -141,6 +159,15 @@ def validate(record: MemoryRecord, config: Config, schema: MemorySchema | None =
         value = fields.get(field)
         if value and not timestamp.is_valid(str(value)):
             errors.append(FieldError(field, "must be an ISO 8601 day or zone-aware instant"))
+
+    start = record.valid_from or record.created
+    if (
+        record.invalid_at
+        and timestamp.is_valid(start)
+        and timestamp.is_valid(record.invalid_at)
+        and timestamp.parse(record.invalid_at) < timestamp.parse(start)
+    ):
+        errors.append(FieldError("invalid_at", "must not precede valid_from"))
 
     if record.superseded_by and not record.invalid_at:
         errors.append(FieldError("invalid_at", "a successor requires an ended validity interval"))

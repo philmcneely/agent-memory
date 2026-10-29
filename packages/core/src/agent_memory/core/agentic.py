@@ -1,10 +1,11 @@
-"""The negotiation between the library and its executor, one round at a time.
+"""The negotiation between the library and its executor over one batch.
 
-Each round the executor either asks for a tool — a search of the store, or one memory in
-full — or hands back the operations. The library runs the tool, appends what it saw to the
-transcript, and asks again, up to a cap. The executor decides; the library executes, so the
-core still holds no model client (Invariant 5). A handle a tool returned is as good as one
-the sheet carried; a handle nobody has seen stays refused.
+A tool reasoner is a standard tool-use agent: it receives the instructions and the batch
+apart, calls the Write toolkit as often as it judges useful, and answers by submitting
+operations. A text reasoner keeps the line protocol: each round it either asks for a look
+or hands back operations as plain text, and the library runs the look through the same
+toolkit. Either way the executor decides and the library executes, so the core still holds
+no model client (Invariant 5).
 """
 
 from __future__ import annotations
@@ -12,18 +13,18 @@ from __future__ import annotations
 import dataclasses
 import json
 
-from . import prompts, reconcile
+from . import prompts, reconcile, toolkit
 from .config import WriteConfig
 from .errors import FieldError
-from .recall import Recall
+from .reasoning import ToolReasoner
 from .store import Store
 
-TOOL_RECALL = "recall"
-TOOL_READ = "read"
+TOOL_RECALL = toolkit.TOOL_RECALL
+TOOL_READ = toolkit.TOOL_READ
 TOOLS = (TOOL_RECALL, TOOL_READ)
 KEY_TOOL = "look"
-KEY_QUERY = "query"
-KEY_NAME = "name"
+KEY_QUERY = toolkit.ARG_QUERY
+KEY_NAME = toolkit.ARG_NAME
 FENCE = "```"
 EXTENSION_ROUNDS = 1
 FORMAT_RETRIES = 1
@@ -41,8 +42,25 @@ class Outcome:
 
 
 def negotiate(
-    store: Store, sheet: reconcile.Sheet, opening: str, ask, config: WriteConfig
+    store: Store, sheet: reconcile.Sheet, brief: prompts.Brief, ask, config: WriteConfig
 ) -> Outcome:
+    kit = toolkit.WriteToolkit(store, sheet)
+    if isinstance(ask, ToolReasoner):
+        return _converse(kit, brief, ask)
+    return _text_protocol(kit, brief.text_protocol(), ask, config)
+
+
+def _converse(kit: toolkit.WriteToolkit, brief: prompts.Brief, ask: ToolReasoner) -> Outcome:
+    ask.converse(brief.tool_system(), brief.material, kit)
+    errors = (
+        []
+        if kit.submission is not None
+        else [FieldError("response", "executor submitted no operations")]
+    )
+    return Outcome(list(kit.submission or []), errors, kit.sheet, len(kit.calls), kit.transcript())
+
+
+def _text_protocol(kit: toolkit.WriteToolkit, opening: str, ask, config: WriteConfig) -> Outcome:
     transcript: list[str] = []
     budget = config.max_rounds
     extended = 0
@@ -61,16 +79,21 @@ def negotiate(
                 budget += 1
                 transcript.append(prompts.format_retry(reply))
                 continue
-            return Outcome(specs, errors, sheet, rounds, "\n\n".join(transcript))
-        observations = []
-        for call in calls:
-            observation, sheet = _run(store, sheet, call, config)
-            observations.append(observation)
+            if not specs and not errors:
+                errors = [FieldError("response", "executor returned no final operations")]
+            return Outcome(specs, errors, kit.sheet, rounds, "\n\n".join(transcript))
+        observations = [_look(kit, call, config) for call in calls]
         transcript.append(prompts.tool_round(reply, "\n\n".join(observations)))
         if last and extended < EXTENSION_ROUNDS:
             extended += 1
             budget += 1
-    return Outcome([], [], sheet, rounds, "\n\n".join(transcript))
+    return Outcome(
+        [],
+        [FieldError("rounds", "executor exhausted rounds without final operations")],
+        kit.sheet,
+        rounds,
+        "\n\n".join(transcript),
+    )
 
 
 def _render(opening: str, transcript: list[str], last: bool) -> str:
@@ -100,40 +123,12 @@ def _split(reply: str) -> tuple[list[dict[str, object]], list[str]]:
     return calls, others
 
 
-def _run(
-    store: Store, sheet: reconcile.Sheet, call: dict[str, object], config: WriteConfig
-) -> tuple[str, reconcile.Sheet]:
+def _look(kit: toolkit.WriteToolkit, call: dict[str, object], config: WriteConfig) -> str:
     tool = str(call.get(KEY_TOOL) or "")
-    if tool == TOOL_RECALL:
-        query = str(call.get(KEY_QUERY) or "").strip()
-        if not query:
-            return prompts.observation(tool, "recall needs a query"), sheet
-        hits = Recall(store).recall(query, limit=config.reconcile_entries, log=False)
-        found = tuple(
-            reconcile.Handle(hit.name, hit.type, hit.status, hit.updated, hit.abstract)
-            for hit in hits
-        )
-        text = "\n".join(handle.render() for handle in found) or "(nothing found)"
-        return prompts.observation(tool, _clip(text, config)), _extend(sheet, found)
-    if tool == TOOL_READ:
-        name = str(call.get(KEY_NAME) or "").strip()
-        record = store.find(name) if name else None
-        if record is None or not record.is_active():
-            return prompts.observation(tool, f"no active memory named {name}"), sheet
-        handle = reconcile.Handle(
-            record.name, record.type, record.status, record.valid_from or "", record.abstract
-        )
-        text = f"{handle.render()}\n\n{record.body.strip()}"
-        return prompts.observation(tool, _clip(text, config)), _extend(sheet, (handle,))
-    return prompts.observation(tool, f"unknown tool; the tools are {', '.join(TOOLS)}"), sheet
-
-
-def _extend(sheet: reconcile.Sheet, found: tuple[reconcile.Handle, ...]) -> reconcile.Sheet:
-    known = sheet.handle_names()
-    fresh = tuple(handle for handle in found if handle.name not in known)
-    if not fresh:
-        return sheet
-    return dataclasses.replace(sheet, handles=sheet.handles + fresh)
+    if tool not in TOOLS:
+        return prompts.observation(tool, f"unknown tool; the tools are {', '.join(TOOLS)}")
+    arguments = {key: value for key, value in call.items() if key != KEY_TOOL}
+    return prompts.observation(tool, _clip(kit.call(tool, arguments).text, config))
 
 
 def _clip(text: str, config: WriteConfig) -> str:

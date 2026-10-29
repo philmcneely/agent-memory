@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import pathlib
 import tomllib
+from typing import Any
 
 CONFIG_FILENAME = "config.toml"
 STORE_ENV_VAR = "AGENT_MEMORY_STORE"
 EXECUTOR_ENV_VAR = "AGENT_MEMORY_EXECUTOR"
 MUSE_SETTINGS_ENV_VAR = "AGENT_MEMORY_MUSE_SETTINGS"
-MUSE_LAUNCHER_ENV_VAR = "AGENT_MEMORY_MUSE_LAUNCHER"
-MUSE_BINARY_ENV_VAR = "AGENT_MEMORY_MUSE_BINARY"
 REASONER_HOST = "host"
 REASONER_ENDPOINT = "endpoint"
+TOOL_MODE_AUTO = "auto"
+TOOL_MODE_NATIVE = "native"
+TOOL_MODE_TEXT = "text"
+COORDINATION_LOCK_POLL_SECONDS = 0.02
+DREAM_CLAIM_ID_LENGTH = 20
+DREAM_ERROR_MAX_CHARS = 1000
+STATE_JSON_INDENT = 2
 DEFAULT_STORE = "~/agent-memory-store"
 LEGACY_KNOBS = {
     "index": frozenset({"raw_chunk_chars"}),
@@ -53,6 +60,7 @@ class IndexConfig:
     chunk_min_chars: int = 200
     bm25_abstract_weight: float = 2.0
     bm25_body_weight: float = 1.0
+    tokenizer: str = "ascii"
     vector_enabled: bool = False
     vector_model: str = "BAAI/bge-small-en-v1.5"
 
@@ -92,6 +100,8 @@ class RecallConfig:
 
 @dataclasses.dataclass
 class ManageConfig:
+    auto_dream: bool = True
+    claim_lease_seconds: float = 1800.0
     trigger_min_hours: float = 24.0
     trigger_min_sessions: int = 3
     cluster_min_files: int = 5
@@ -105,6 +115,11 @@ class ManageConfig:
     max_splits_per_sleep: int = 2
     max_deletes_per_sleep: int = 3
     split_min_sections: int = 3
+    review_max_steps: int = 8
+    review_max_tool_calls: int = 24
+    review_tool_result_chars: int = 8000
+    review_evidence_chars: int = 32000
+    review_raw_session_evidence: bool = False
     git_commit: bool = True
     dream_report_dirname: str = "dream-reports"
 
@@ -132,16 +147,36 @@ class WriteConfig:
 
 
 @dataclasses.dataclass
+class OperationExecutorConfig:
+    reasoner: str = ""
+    host: str = ""
+    host_provider: str = ""
+    host_allow_data_training: bool = False
+    host_model: str = ""
+    model: str = ""
+    endpoint: str = ""
+    project: str = ""
+    location: str = ""
+    timeout_seconds: float = 0.0
+    tool_mode: str = ""
+
+
+@dataclasses.dataclass
 class ExecutorConfig:
     reasoner: str = REASONER_HOST
     host: str = "claude-code"
+    host_provider: str = ""
+    host_allow_data_training: bool = False
     host_model: str = ""
     model: str = "google/gemini-3.7-flash"
     endpoint: str = ""
     project: str = ""
     location: str = "global"
     timeout_seconds: float = 120.0
+    tool_mode: str = TOOL_MODE_AUTO
     command: str = "mem distill"
+    write: OperationExecutorConfig = dataclasses.field(default_factory=OperationExecutorConfig)
+    manage: OperationExecutorConfig = dataclasses.field(default_factory=OperationExecutorConfig)
 
 
 @dataclasses.dataclass
@@ -170,13 +205,7 @@ class Config:
             section = getattr(config, section_name, None)
             if section is None or not dataclasses.is_dataclass(section):
                 raise ValueError(f"unknown config section: {section_name}")
-            known = {field.name for field in dataclasses.fields(section)}
-            for key, value in values.items():
-                if key in LEGACY_KNOBS.get(section_name, ()):
-                    continue
-                if key not in known:
-                    raise ValueError(f"unknown config knob: {section_name}.{key}")
-                setattr(section, key, value)
+            _load_section(section, values, section_name)
         config.validate_index()
         return config
 
@@ -185,6 +214,15 @@ class Config:
             raise ValueError("index.vector_enabled must be a boolean")
         if not isinstance(self.index.vector_model, str) or not self.index.vector_model.strip():
             raise ValueError("index.vector_model must be a non-empty string")
+        from .tokenization import SUPPORTED_TOKENIZERS
+
+        if self.index.tokenizer not in SUPPORTED_TOKENIZERS:
+            raise ValueError(
+                f"index.tokenizer must be one of {sorted(SUPPORTED_TOKENIZERS)}, "
+                f"got {self.index.tokenizer!r}"
+            )
+        if not isinstance(self.manage.review_raw_session_evidence, bool):
+            raise ValueError("manage.review_raw_session_evidence must be a boolean")
 
     def save(self, store_root: pathlib.Path) -> pathlib.Path:
         path = pathlib.Path(store_root) / CONFIG_FILENAME
@@ -233,16 +271,65 @@ def _render_value(value: object) -> str:
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_render_value(item) for item in value) + "]"
     if isinstance(value, dict):
-        return "{" + ", ".join(f"{k} = {_render_value(v)}" for k, v in value.items()) + "}"
-    return '"' + str(value).replace('"', '\\"') + '"'
+        return (
+            "{"
+            + ", ".join(f"{_render_value(str(k))} = {_render_value(v)}" for k, v in value.items())
+            + "}"
+        )
+    return json.dumps(str(value), ensure_ascii=False)
 
 
 def _render_toml(config: Config) -> str:
     lines: list[str] = []
     for section_field in dataclasses.fields(config):
         section = getattr(config, section_field.name)
-        lines.append(f"[{section_field.name}]")
-        for knob in dataclasses.fields(section):
-            lines.append(f"{knob.name} = {_render_value(getattr(section, knob.name))}")
-        lines.append("")
+        _render_section(lines, section_field.name, section)
     return "\n".join(lines)
+
+
+def _load_section(section: Any, values: object, path: str) -> None:
+    if not isinstance(values, dict):
+        raise ValueError(f"config section must be a table: {path}")
+    known = {field.name for field in dataclasses.fields(section)}
+    for key, value in values.items():
+        if key in LEGACY_KNOBS.get(path, ()):
+            continue
+        if key not in known:
+            raise ValueError(f"unknown config knob: {path}.{key}")
+        current = getattr(section, key)
+        if dataclasses.is_dataclass(current):
+            _load_section(current, value, f"{path}.{key}")
+        elif isinstance(value, dict) and not isinstance(current, dict):
+            raise ValueError(f"config knob must not be a table: {path}.{key}")
+        elif _has_declared_type(current, value):
+            setattr(section, key, value)
+        else:
+            raise ValueError(f"config knob has the wrong type: {path}.{key}")
+
+
+def _has_declared_type(current: object, value: object) -> bool:
+    if isinstance(current, bool):
+        return isinstance(value, bool)
+    if isinstance(value, bool):
+        return False
+    if isinstance(current, int):
+        return isinstance(value, int)
+    if isinstance(current, float):
+        return isinstance(value, int | float)
+    if isinstance(current, str):
+        return isinstance(value, str)
+    return True
+
+
+def _render_section(lines: list[str], path: str, section: Any) -> None:
+    lines.append(f"[{path}]")
+    children: list[tuple[str, object]] = []
+    for knob in dataclasses.fields(section):
+        value = getattr(section, knob.name)
+        if dataclasses.is_dataclass(value):
+            children.append((knob.name, value))
+        else:
+            lines.append(f"{knob.name} = {_render_value(value)}")
+    lines.append("")
+    for name, child in children:
+        _render_section(lines, f"{path}.{name}", child)

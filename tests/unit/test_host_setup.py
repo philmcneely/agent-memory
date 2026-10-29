@@ -4,58 +4,18 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shlex
 import subprocess
 
 import pytest
-from agent_memory.adapters import doctor, host_setup, moments, muse_sdk, openrouter, setup
+from agent_memory.adapters import doctor, host_setup, moments, openrouter, setup
 from agent_memory.core import prompts
+from agent_memory.core.config import OperationExecutorConfig
 from agent_memory.core.errors import ValidationError
 from agent_memory.core.store import Store
 
 HOSTS = (moments.HOST_CLAUDE_CODE, moments.HOST_CODEX, moments.HOST_MUSE_CODE)
-
-
-def test_sdk_setup_dispatches_to_the_isolated_muse_bootstrap(tmp_path, monkeypatch):
-    expected = {"status": doctor.READY, "mode": "sdk-managed"}
-    observed = {}
-
-    def bootstrap(store, **kwargs):
-        observed.update(store=store, **kwargs)
-        return expected
-
-    monkeypatch.setattr(muse_sdk, "run", bootstrap)
-
-    result = host_setup.run(
-        Store(tmp_path / "store"),
-        moments.HOST_MUSE_CODE,
-        provider=openrouter.PROVIDER,
-        model="meta/custom",
-        sdk=True,
-    )
-
-    assert result == expected
-    assert observed["provider"] == openrouter.PROVIDER
-    assert observed["model"] == "meta/custom"
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"host": moments.HOST_CODEX, "provider": openrouter.PROVIDER},
-        {"host": moments.HOST_MUSE_CODE, "provider": None},
-        {
-            "host": moments.HOST_MUSE_CODE,
-            "provider": openrouter.PROVIDER,
-            "settings_path": pathlib.Path("settings.json"),
-        },
-        {"host": moments.HOST_MUSE_CODE, "provider": openrouter.PROVIDER, "mcp": True},
-    ],
-)
-def test_sdk_setup_rejects_ambiguous_or_persistent_setup_options(tmp_path, kwargs):
-    options = dict(kwargs)
-    host = options.pop("host")
-    with pytest.raises(ValidationError, match="sdk"):
-        host_setup.run(Store(tmp_path / "store"), host, sdk=True, **options)
+LIVE_REASONER_CHECK = doctor._live_reasoner_check
 
 
 @pytest.fixture(autouse=True)
@@ -64,8 +24,10 @@ def _stub_live_host_reasoner(monkeypatch):
     monkeypatch.setattr(
         doctor,
         "_live_reasoner_check",
-        lambda _store, _host: doctor.Check(
-            "REASONER_LIVE_OK", True, "fixture host reasoner completed"
+        lambda _store, _host, operation: doctor.Check(
+            f"{operation.upper()}_REASONER_LIVE_OK",
+            True,
+            f"{operation} fixture reasoner completed",
         ),
     )
 
@@ -90,9 +52,83 @@ def test_fresh_and_repeated_setup_share_one_idempotent_pipeline(tmp_path, monkey
     assert (store.root / "config.toml").is_file()
     assert setup.skill_path(host, target).read_text(encoding="utf-8") == prompts.skill()
     for event in moments.DIALECTS[host]:
-        rendered = json.dumps(configured["hooks"][event])
-        assert rendered.count(f"mem-hook --host {host}") == 1
-        assert str(store.root) in rendered
+        entries = configured["hooks"][event]
+        commands = [hook["command"] for entry in entries for hook in entry["hooks"]]
+        assert len(commands) == 1
+        words = shlex.split(commands[0])
+        assert pathlib.Path(words[0]).stem == setup.HOOK_COMMAND
+        assert words[1:3] == [setup.HOST_FLAG, host]
+        assert pathlib.Path(words[words.index(setup.STORE_FLAG) + 1]) == store.root
+
+
+def test_successful_host_setup_sets_the_default_manual_sleep_host(tmp_path, monkeypatch):
+    target = tmp_path / "codex" / "hooks.json"
+    store = Store(tmp_path / "store")
+    monkeypatch.setattr(setup, "probe", lambda selected: f"{selected} 1.0")
+
+    report = host_setup.run(store, moments.HOST_CODEX, settings_path=target)
+
+    assert report["status"] == doctor.READY
+    configured = Store(store.root).config.executor
+    assert configured.host == moments.HOST_CLAUDE_CODE
+    assert configured.manage == OperationExecutorConfig(
+        reasoner="host",
+        host=moments.HOST_CODEX,
+    )
+
+
+def test_host_setup_does_not_replace_an_explicit_endpoint_reasoner(tmp_path, monkeypatch):
+    target = tmp_path / "codex" / "hooks.json"
+    store = Store(tmp_path / "store")
+    store.init()
+    store.config.executor.reasoner = "endpoint"
+    store.config.executor.host = moments.HOST_CLAUDE_CODE
+    store.config.save(store.root)
+    monkeypatch.setattr(setup, "probe", lambda selected: f"{selected} 1.0")
+
+    host_setup.run(store, moments.HOST_CODEX, settings_path=target)
+
+    configured = Store(store.root).config.executor
+    assert configured.reasoner == "endpoint"
+    assert configured.host == moments.HOST_CLAUDE_CODE
+
+
+def test_host_setup_preserves_an_explicit_manage_policy(tmp_path, monkeypatch):
+    target = tmp_path / "codex" / "hooks.json"
+    store = Store(tmp_path / "store")
+    store.init()
+    store.config.executor.manage = OperationExecutorConfig(
+        reasoner="endpoint",
+        endpoint="https://manage.example/v1",
+    )
+    store.config.save(store.root)
+    monkeypatch.setattr(setup, "probe", lambda selected: f"{selected} 1.0")
+
+    host_setup.run(store, moments.HOST_CODEX, settings_path=target)
+
+    configured = Store(store.root).config.executor.manage
+    assert configured.reasoner == "endpoint"
+    assert configured.endpoint == "https://manage.example/v1"
+
+
+def test_failed_host_setup_does_not_persist_a_seeded_manage_policy(tmp_path, monkeypatch):
+    target = tmp_path / "codex" / "hooks.json"
+    store = Store(tmp_path / "store")
+    monkeypatch.setattr(setup, "probe", lambda selected: f"{selected} 1.0")
+    monkeypatch.setattr(
+        doctor,
+        "_live_reasoner_check",
+        lambda _store, _host, operation: doctor.Check(
+            f"{operation.upper()}_REASONER_LIVE_FAILED",
+            False,
+            "fixture failure",
+        ),
+    )
+
+    report = host_setup.run(store, moments.HOST_CODEX, settings_path=target)
+
+    assert report["status"] == doctor.FAILED
+    assert Store(store.root).config.executor.manage == OperationExecutorConfig()
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -162,7 +198,9 @@ def test_muse_openrouter_routing_and_mcp_merge_without_replacing_other_config(tm
         "auth": "bearer",
     }
     assert configured["mcp_servers"]["other"] == {"command": "other"}
-    assert str(store.resolve()) in json.dumps(configured["mcp_servers"]["agent-memory"])
+    assert str(store.resolve()) in json.dumps(
+        configured["mcp_servers"]["agent-memory"], ensure_ascii=False
+    ).replace("\\\\", "\\")
 
 
 @pytest.mark.parametrize(
@@ -225,9 +263,9 @@ def test_muse_doctor_rejects_hook_without_pinned_settings(tmp_path, monkeypatch)
     configured = json.loads(target.read_text(encoding="utf-8"))
     for entries in configured["hooks"].values():
         command = entries[0]["hooks"][0]["command"]
-        entries[0]["hooks"][0]["command"] = command.replace(
-            f" {setup.MUSE_SETTINGS_FLAG} {target.resolve()}", ""
-        )
+        pinned = setup.render_command([setup.MUSE_SETTINGS_FLAG, str(target.resolve())])
+        assert f" {pinned}" in command
+        entries[0]["hooks"][0]["command"] = command.replace(f" {pinned}", "")
     target.write_text(json.dumps(configured), encoding="utf-8")
     monkeypatch.setattr(setup, "probe", lambda _host: "Muse 1.4")
     monkeypatch.setattr(openrouter, "detect_credential", lambda _env=None: None)
@@ -353,15 +391,17 @@ def test_host_reasoner_failure_prevents_ready(tmp_path, monkeypatch):
     monkeypatch.setattr(
         doctor,
         "_live_reasoner_check",
-        lambda _store, _host: doctor.Check(
-            "REASONER_UNAVAILABLE", False, "live reasoner returned no READY"
+        lambda _store, _host, operation: doctor.Check(
+            f"{operation.upper()}_REASONER_UNAVAILABLE",
+            False,
+            f"{operation} live reasoner returned no READY",
         ),
     )
 
     result = host_setup.run(store, moments.HOST_CODEX, settings_path=target)
 
     assert result["status"] == doctor.FAILED
-    assert "REASONER_UNAVAILABLE" in {
+    assert "WRITE_REASONER_UNAVAILABLE" in {
         check["code"] for check in result["checks"]
     }
 
@@ -372,7 +412,7 @@ def test_doctor_accepts_an_explicit_user_vertex_project_without_a_custom_endpoin
 
     check = doctor._reasoner_checks(store, moments.HOST_CODEX)[0]
 
-    assert check.code == "REASONER_AVAILABLE"
+    assert check.code == "WRITE_REASONER_AVAILABLE"
     assert check.ok
     assert check.detail == "Vertex AI project user-project"
 
@@ -384,7 +424,7 @@ def test_doctor_rejects_endpoint_opt_in_without_user_configuration(store):
 
     check = doctor._reasoner_checks(store, moments.HOST_CODEX)[0]
 
-    assert check.code == "REASONER_UNAVAILABLE"
+    assert check.code == "WRITE_REASONER_UNAVAILABLE"
     assert not check.ok
     assert "project" in check.detail
 
@@ -398,8 +438,63 @@ def test_doctor_accepts_user_owned_vertex_configuration_from_the_environment(sto
         {"GOOGLE_CLOUD_PROJECT": "environment-project", "VERTEX_LOCATION": "global"},
     )[0]
 
-    assert check.code == "REASONER_AVAILABLE"
+    assert check.code == "WRITE_REASONER_AVAILABLE"
     assert check.detail == "Vertex AI project environment-project"
+
+
+def test_doctor_attributes_independent_reasoner_availability_to_each_channel(
+    store, monkeypatch
+):
+    store.config.executor.write = OperationExecutorConfig(reasoner="host", host="muse-code")
+    store.config.executor.manage = OperationExecutorConfig(
+        reasoner="endpoint", endpoint="https://manage.example/v1"
+    )
+    monkeypatch.setattr(
+        "agent_memory.executor.hosts.shutil.which",
+        lambda binary: f"/usr/bin/{binary}" if binary == "muse" else None,
+    )
+
+    checks = doctor._reasoner_checks(
+        store,
+        moments.HOST_CODEX,
+        {"GEMINI_API_KEY": "user-key"},
+    )
+
+    assert [(check.code, check.ok) for check in checks] == [
+        ("WRITE_REASONER_AVAILABLE", True),
+        ("MANAGE_REASONER_AVAILABLE", True),
+    ]
+    assert "muse-code" in checks[0].detail
+    assert "explicit model endpoint" in checks[1].detail
+
+
+def test_live_preflight_uses_the_resolved_host_for_each_channel(store, monkeypatch):
+    store.config.executor.write = OperationExecutorConfig(reasoner="host", host="muse-code")
+    store.config.executor.manage = OperationExecutorConfig(reasoner="host", host="codex")
+    called = []
+
+    class Ready:
+        def __init__(self, configured):
+            self.host = type(
+                "ConfiguredHost",
+                (),
+                {"spec": type("Spec", (), {"name": configured.host})()},
+            )()
+
+        def __call__(self, _prompt):
+            called.append(self.host.spec.name)
+            return "AGENT_MEMORY_READY"
+
+    monkeypatch.setattr(
+        "agent_memory.executor.distiller.distiller", lambda configured: Ready(configured)
+    )
+
+    write = LIVE_REASONER_CHECK(store, moments.HOST_CODEX, "write")
+    manage = LIVE_REASONER_CHECK(store, moments.HOST_CODEX, "manage")
+
+    assert write.code == "WRITE_REASONER_LIVE_OK"
+    assert manage.code == "MANAGE_REASONER_LIVE_OK"
+    assert called == ["muse-code", "codex"]
 
 
 def test_codex_doctor_flags_disabled_hooks_read_only_sandbox_and_store_failure(

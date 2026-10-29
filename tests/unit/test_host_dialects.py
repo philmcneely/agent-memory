@@ -69,6 +69,20 @@ def test_claude_code_delivers_the_system_prompt_by_flag(tmp_path):
     assert "keeper" in command
 
 
+def test_claude_code_without_tools_loads_none_of_the_user_s_mcp_servers(tmp_path):
+    """Observed live: user MCP tool definitions alone overflowed Haiku's context window."""
+    command = hosts.DIALECTS[hosts.HOST_CLAUDE_CODE].command(
+        _spec(hosts.HOST_CLAUDE_CODE),
+        tools_enabled=False,
+        system_prompt="reviewer",
+        max_turns=1,
+        store_root=None,
+        answer_file=tmp_path / "answer.txt",
+    )
+    assert "--strict-mcp-config" in command
+    assert "--mcp-config" not in command
+
+
 def test_codex_is_given_write_access_to_the_store_it_must_reach(tmp_path):
     store = tmp_path / "store"
     command = hosts.DIALECTS[hosts.HOST_CODEX].command(

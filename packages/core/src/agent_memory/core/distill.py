@@ -11,7 +11,8 @@ import dataclasses
 from collections.abc import Callable
 
 from . import agentic, batching, pending, prompts, reconcile, render
-from .errors import FieldError
+from .errors import FieldError, ValidationError
+from .locking import file_lock
 from .sessions import Message, Pointer, render_pointer
 from .store import BatchResult, Rejected, Store
 from .watermark import Watermark
@@ -59,14 +60,16 @@ def distill(store: Store, session: str, messages: list[Message], ask: Ask) -> Di
     distilled = watermark.read(session).distilled
     for batch in batching.batches(messages, config.max_distill_input_chars):
         sheet = reconcile.build(store, session, batch)
-        prompt = prompts.distill_sheet(
+        brief = prompts.distill_brief(
             prompts.slot_table(sheet.slots),
             sheet.render(),
             render.conversation(batch),
             slot_table=config.slot_table,
             event_lane=config.event_lane,
         )
-        outcome = agentic.negotiate(store, sheet, prompt, ask, config)
+        outcome = agentic.negotiate(store, sheet, brief, ask, config)
+        if outcome.errors:
+            raise ValidationError(outcome.errors)
         sheet = outcome.sheet
         specs, errors = outcome.specs, outcome.errors
         specs = queue.drain(session) + specs
@@ -84,7 +87,11 @@ def distill(store: Store, session: str, messages: list[Message], ask: Ask) -> Di
             )
         queued = queue.append(session, [spec for spec, _ in leftovers])
         distilled = max(distilled, batch[-1].index + 1)
-        watermark.settle(session, distilled)
+        with file_lock(
+            store.layout.capture_lock,
+            timeout=store.config.storage.lock_timeout_seconds,
+        ):
+            watermark.settle(session, distilled)
         reports.append(
             BatchReport(
                 pointer=render_pointer(sheet.pointer),

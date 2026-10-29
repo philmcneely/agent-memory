@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agent_memory.core import timestamp
 from agent_memory.core.errors import FieldError, ValidationError
 from agent_memory.core.recall import Recall
 from agent_memory.core.store import LEVEL_FULL, LEVELS, Store
@@ -24,7 +25,7 @@ SCHEMAS: dict[str, dict[str, object]] = {
             "query": {"type": "string"},
             "scope": {"type": "string"},
             "as_of": {"type": "string"},
-            "limit": {"type": "integer"},
+            "limit": {"type": "integer", "minimum": 1},
         },
         "required": ["query"],
     },
@@ -146,6 +147,32 @@ def _require(tool: str, arguments: dict[str, object]) -> None:
     ):
         raise ValidationError([FieldError("provenance", "must be an array of references")])
     schema = SCHEMAS[tool]
+    properties = schema.get("properties")
+    for field, value in arguments.items():
+        rules = properties.get(field) if isinstance(properties, dict) else None
+        if not isinstance(rules, dict):
+            continue
+        kind = rules.get("type")
+        valid = {
+            "string": isinstance(value, str),
+            "integer": isinstance(value, int) and not isinstance(value, bool),
+            "boolean": isinstance(value, bool),
+            "object": isinstance(value, dict),
+            "array": isinstance(value, list),
+        }.get(str(kind), True)
+        if not valid:
+            raise ValidationError([FieldError(field, f"must be a {kind}")])
+        if (
+            isinstance(value, dict)
+            and rules.get("additionalProperties") == {"type": "string"}
+            and not all(
+                isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+            )
+        ):
+            raise ValidationError([FieldError(field, "must map strings to strings")])
+        minimum = rules.get("minimum")
+        if isinstance(minimum, int) and isinstance(value, int) and value < minimum:
+            raise ValidationError([FieldError(field, f"must be at least {minimum}")])
     required = schema.get("required")
     missing = [
         field
@@ -167,10 +194,15 @@ def _require(tool: str, arguments: dict[str, object]) -> None:
 
 
 def _recall(store: Store, arguments: dict[str, object]) -> dict[str, object]:
+    as_of = _optional(arguments, "as_of")
+    if as_of is not None and not timestamp.is_valid(as_of):
+        raise ValidationError(
+            [FieldError("as_of", "must be an ISO-8601 date or a date-time with a time zone")]
+        )
     hits = Recall(store).recall(
         str(arguments["query"]),
         scope=_optional(arguments, "scope"),
-        as_of=_optional(arguments, "as_of"),
+        as_of=as_of,
         limit=int(str(arguments["limit"])) if arguments.get("limit") else None,
     )
     return {
