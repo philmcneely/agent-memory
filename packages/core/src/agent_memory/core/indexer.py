@@ -11,11 +11,12 @@ from .clock import Clock
 from .database import Database
 from .embeddings import Embedder
 from .errors import ValidationError
-from .manifest import Manifest, content_hash
+from .manifest import IndexMeta, Manifest, content_hash
 from .paths import StoreLayout
 from .record import MemoryRecord
 from .schema import SchemaRegistry
 from .search_index import SearchIndex
+from .tokenization import TOKENIZER_ASCII
 from .vector_index import VectorIndex
 
 
@@ -42,10 +43,13 @@ class Indexer:
         self._embedder = embedder
 
     def sync(self) -> IndexReport:
+        if self._tokenizer_drifted():
+            self._database.drop()
         present = self._present_hashes()
         with self._database.connect() as connection:
             manifest = Manifest(connection, self._config.index.hash_prefix_length)
-            index = SearchIndex(connection)
+            index = SearchIndex(connection, self._config.index.tokenizer)
+            IndexMeta(connection).set_tokenizer(self._config.index.tokenizer)
             delta = manifest.diff(present)
             unreadable: list[str] = []
             reindexed: list[str] = []
@@ -94,6 +98,16 @@ class Indexer:
     def rebuild(self) -> IndexReport:
         self._database.drop()
         return self.sync()
+
+    def _tokenizer_drifted(self) -> bool:
+        """A changed tokenizer means the FTS projection is stale even though file hashes are not."""
+        if not self._layout.index_db.exists():
+            return False
+        with self._database.connect() as connection:
+            stored = IndexMeta(connection).tokenizer()
+        if stored is None:
+            return self._config.index.tokenizer != TOKENIZER_ASCII
+        return stored != self._config.index.tokenizer
 
     def _present_hashes(self) -> dict[str, str]:
         present: dict[str, str] = {}
