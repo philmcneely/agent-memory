@@ -32,4 +32,6 @@ against malicious out-of-band edits to archived Session files.
 
 Structured host messages preserve their original leading indentation and trailing whitespace in raw storage. Code excerpts and quoted text remain faithful evidence while projections retain their own formatting rules.
 
+Raw session ranges include blank messages. Appending them preserves contiguous indices and keeps subsequent provenance ranges bound to their original positions.
+
 Raw provenance is append-only even when a clock and excerpt produce an existing filename. Concurrent or repeated evidence captures preserve earlier content and source attribution instead of rewriting it.
