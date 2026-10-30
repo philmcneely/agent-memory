@@ -210,7 +210,11 @@ class Store:
         )
         supersedes = str(spec.get("supersedes") or "") or None
         derived_name = not spec.get("name")
-        if supersedes and derived_name and (self.root / placed.relative_path).exists():
+        if (
+            supersedes
+            and derived_name
+            and (placed.name == supersedes or (self.root / placed.relative_path).exists())
+        ):
             placed = self._successor_placement(placed)
         target = self.root / placed.relative_path
         if self.layout.type_of(target) != schema.type:
@@ -327,7 +331,7 @@ class Store:
         if parse_pointer(item) is not None:
             return item.strip()
         stored = self.archive.append_provenance(name, item, source=self.agent)
-        return str(stored.relative_to(self.root))
+        return stored.relative_to(self.root).as_posix()
 
     def _reject_facts_dated_after_their_evidence(self, record: MemoryRecord) -> None:
         """A fact cannot hold from later than the conversation that stated it."""
@@ -451,6 +455,28 @@ class Store:
             expected_source_hash=expected_source_hash,
             expected_successor_hash=expected_successor_hash,
         )
+
+    def merge_exact_duplicate(
+        self, duplicate: MemoryRecord, keeper: MemoryRecord, at: str
+    ) -> MemoryRecord | None:
+        """Invalidate ``duplicate`` into ``keeper`` under one writer lock, after
+        revalidating the keeper against the live store.
+
+        Manage picks the keeper from a snapshot taken before any lock. If the
+        keeper was deleted, superseded or otherwise invalidated between that
+        snapshot and this write, invalidating the duplicate anyway would orphan
+        its content into a dead name — both records gone while each looked
+        individually consistent. The stale-write detection in ``_write_locked``
+        cannot catch this: it only guards the file being written, here the
+        duplicate. Re-finding the keeper inside the same lock closes the
+        window; a keeper that no longer reads back active makes the merge a
+        no-op (returns ``None``) so a later pass can re-group the duplicate."""
+        with store_lock(self.layout):
+            fresh = self.find(keeper.name)
+            if fresh is None or not fresh.is_active():
+                return None
+            record_module.invalidate(duplicate, at, keeper.name)
+            return self._write_locked(duplicate)
 
     def merge(
         self,
@@ -679,7 +705,7 @@ class Store:
     def _at(self, path: pathlib.Path | None) -> MemoryRecord | None:
         if path is None or not path.exists() or self.layout.type_of(path) is None:
             return None
-        return MemoryRecord.from_text(path.read_text(encoding="utf-8"), path)
+        return MemoryRecord.from_file(path)
 
     def _scan_for(self, name: str) -> pathlib.Path | None:
         for path in self.layout.truth_files():
