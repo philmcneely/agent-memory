@@ -20,6 +20,15 @@
   bounds are needed; current correct replaces the complete list.
 - Review recovery of interrupted multi-file operations outside Git-backed stores.
 
+## Platform follow-ups
+
+- Render setup/doctor checks as code, status and detail in text mode; the recall-hit line
+  renderer prints them as empty `name — abstract · path · score=None` rows on every platform.
+- Pass the Claude Code text-protocol system prompt by file as the tool posture already does;
+  an inline argument can exceed the Windows command-line limit for long prompts.
+- Confirm on a live Codex Windows install which shell runs user hooks and that the rendered
+  hook command executes there after the one-time trust review.
+
 ## Executor follow-ups
 
 - Persist a per-run Write trace (messages, tool calls, operations, usage), add explicit cache
@@ -32,10 +41,6 @@
   with many servers their tool definitions alone overflow Haiku's context, and any memory-like
   server contaminates attribution. Decide strict MCP for harness runs and record the change in
   the experiment ledger.
-- A supersede whose new key lands in another group but keeps the subject derives the
-  predecessor's own name: successor placement checks only the target path, so the Store refuses
-  "cannot supersede itself". Gemini 2.5 Flash looped seven refusals on it and gave up
-  (OpenRouter, 2026-10-14). Successor naming should check names, not only paths.
 - An announced future effective date ("from Saturday") is refused as a valid_from later than its
   evidence; Haiku 4.5 and Gemini 2.5 Flash set one on about half their first submissions, which
   costs a turn. Decide whether the Store accepts announced effective dates; a schema description
@@ -46,6 +51,9 @@
 - Measure native-tool distillation on real boundaries and a write-side benchmark round. On one
   fixed supersede scenario, Haiku took a median 14 s in one process against 33 s for the text
   protocol (evidence: experiments/runs/native-tools-latency).
+- Haiku 4.5 sometimes closes a batch with nothing worth keeping in plain text instead of
+  submitting a Skip; the batch fails closed and succeeds on a later run (observed twice in three
+  Windows runs, 2026-10-22). Decide whether a no-submission answer should count as Skip.
 - Verify the Codex lifecycle hooks end to end, including the one-time hook trust review; the
   Codex Write executor is verified live, the hooks by unit tests only.
 
