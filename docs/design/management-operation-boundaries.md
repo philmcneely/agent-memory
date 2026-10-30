@@ -51,6 +51,8 @@ Memory identity and type identifiers match their complete slug grammar. Trailing
 
 Malformed final operations or exhausted executor negotiation cannot mark an archived batch as distilled. The boundary reports validation failure before draining pending operations or publishing projection writes, preserving the raw backlog for a later retry.
 
+Automatic links count memories returned together in individual recall events. Repeating the same query can supply multiple observations, while unrelated calls sharing query text cannot manufacture cooccurrence. Recall records one shared timestamp per result batch.
+
 Legacy configuration migration removes obsolete knobs while preserving supported storage customizations. Abstract limits, default project identity and lock timing are retained instead of being silently reset to factory defaults.
 
 Legacy migration distinguishes current reference and experience schemas from old domain directories with the same names. Rerunning migration leaves current truth untouched and no longer reports a fully migrated store as needing migration.
